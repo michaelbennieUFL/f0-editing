@@ -1,4 +1,19 @@
-# Dichotic Pitch Editor (Praat overlap-add)
+# Dichotic Pitch Editor
+
+The editor has independent synthesis-interface tabs:
+
+- **Praat** uses native overlap-add resynthesis with independent left/right PitchTier curves.
+- **PitchFlower** uses two independent neural renders. Its editable curves, flow steps, guidance, seed, generated result F0 overlays, and audio cache are separate from Praat's data.
+
+Both tabs share the timeline, dichotic playback modes, exports, undoable contour editing, and one versioned project file. Generated PitchFlower F0 is shown as a dashed result overlay and never overwrites either editable curve. PitchFlower works at 24 kHz and reports an error when resampled source audio exceeds its supported duration.
+
+Install the optional neural stack before selecting its tab:
+
+```bash
+uv sync --extra pitchflower
+```
+
+Existing `dichotic-praat-editor-v1` project files are migrated on load. New saves use `dichotic-editor-v2` and retain isolated state for each available interface.
 
 A standalone Python application for creating **two independently editable F0 contours** for the same recording, with the original time alignment preserved.
 

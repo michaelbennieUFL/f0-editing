@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QFrame, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
     QPushButton, QScrollArea, QSizePolicy, QSlider, QSplitter, QStatusBar, QVBoxLayout,
-    QWidget,
+    QWidget, QTabBar,
 )
 
 LEFT = "left"
@@ -48,6 +48,8 @@ from praat_backend import (
     resample_editable_pitch, insert_editable_point, delete_editable_point,
     simplify_segmented_pitch, mix_white_noise,
 )
+from dichotic.project import PROJECT_FORMAT, migrate_legacy, new_project, resolve_audio_path
+from dichotic.interfaces.pitchflower import PitchFlowerEngine, PitchFlowerResult
 
 
 @dataclass
@@ -78,6 +80,8 @@ class PitchCanvas(QWidget):
         self.right = np.empty((0, 2), dtype=float)
         self.original = np.empty((0, 2), dtype=float)
         self.original_breaks: tuple[int, ...] = ()
+        self.result_left = np.empty((0, 2), dtype=float)
+        self.result_right = np.empty((0, 2), dtype=float)
         # Indices of the first point in each voiced region after a gap.
         # Independent for left and right; these survive point re-spacing.
         self.segment_breaks: dict[str, tuple[int, ...]] = {LEFT: (), RIGHT: ()}
@@ -106,6 +110,14 @@ class PitchCanvas(QWidget):
         self.ymin = max(30.0, low * 0.72)
         self.ymax = high * 1.12
         self.selected_index = None
+        self.update()
+
+    def set_result(self, left: np.ndarray | None, right: np.ndarray | None):
+        """Set measured synthesis output; never changes editable control points."""
+        self.result_left = (np.empty((0, 2), dtype=float) if left is None
+                            else np.asarray(left, dtype=float).reshape((-1, 2)).copy())
+        self.result_right = (np.empty((0, 2), dtype=float) if right is None
+                             else np.asarray(right, dtype=float).reshape((-1, 2)).copy())
         self.update()
 
     def set_active(self, active: str):
@@ -189,6 +201,10 @@ class PitchCanvas(QWidget):
         # Original is a faint dashed reference, and active channel is on top.
         self._draw_tier(p, self.original, QColor("#a4a9b2"), dashed=True,
                         breaks=self.original_breaks)
+        # Measured generated F0 is deliberately a result-only overlay. It is
+        # not fed back into either editable tier.
+        self._draw_tier(p, self.result_left, QColor("#d34b94"), dashed=True)
+        self._draw_tier(p, self.result_right, QColor("#7654c9"), dashed=True)
         for side in (RIGHT, LEFT) if self.active == LEFT else (LEFT, RIGHT):
             self._draw_tier(p, self.points(side), COLORS[side], side=side,
                             breaks=self.segment_breaks[side], foreground=(side == self.active))
@@ -434,6 +450,10 @@ class Editor(QMainWindow):
         self.setWindowTitle("Dichotic Pitch Editor — Praat overlap-add")
         self.resize(1250, 950)
         self.engine: PraatEngine | None = None
+        self.engines: dict[str, object] = {}
+        self.interface_states: dict[str, dict] = {}
+        self.interface_errors: dict[str, str] = {}
+        self.interface_name = "praat"
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="praat-resynth")
         self.signals=WorkSignals()
         self.signals.ready.connect(self.on_render_ready)
@@ -448,6 +468,7 @@ class Editor(QMainWindow):
         self.render_inflight=False
         self.pending_play: PlaybackRequest | None=None
         self.pending_export: str | None=None
+        self.cached_result_f0: tuple[np.ndarray, np.ndarray] | None = None
         self.undo_stack: list[tuple[np.ndarray, np.ndarray, tuple[int, ...], tuple[int, ...]]] = []
         self.redo_stack: list[tuple[np.ndarray, np.ndarray, tuple[int, ...], tuple[int, ...]]] = []
         self._build_ui()
@@ -480,6 +501,16 @@ class Editor(QMainWindow):
         bar.addWidget(self.filename)
         layout.addLayout(bar)
 
+        tabs=QHBoxLayout()
+        tabs.addWidget(QLabel("Synthesis interface:"))
+        self.interface_tabs=QTabBar()
+        self.interface_tabs.addTab("Praat")
+        self.interface_tabs.addTab("PitchFlower")
+        self.interface_tabs.currentChanged.connect(self.switch_interface)
+        tabs.addWidget(self.interface_tabs)
+        tabs.addStretch()
+        layout.addLayout(tabs)
+
         analysis=QHBoxLayout()
         analysis.addWidget(QLabel("Pitch analysis: floor"))
         self.floor_spin=self._spin(75,50,500,1)
@@ -497,6 +528,24 @@ class Editor(QMainWindow):
         analysis.addWidget(self.side_select)
         analysis.addStretch()
         layout.addLayout(analysis)
+
+        self.pitchflower_controls=QHBoxLayout()
+        self.pitchflower_controls.addWidget(QLabel("PitchFlower flow steps"))
+        self.flow_steps_spin=self._spin(100, 1, 500, 1)
+        self.pitchflower_controls.addWidget(self.flow_steps_spin)
+        self.pitchflower_controls.addWidget(QLabel("Guidance"))
+        self.flow_guidance_spin=self._spin(2.0, 0.0, 20.0, 0.1, decimals=2)
+        self.pitchflower_controls.addWidget(self.flow_guidance_spin)
+        self.pitchflower_controls.addWidget(QLabel("Seed"))
+        self.flow_seed_spin=self._spin(0, 0, 2_147_483_647, 1)
+        self.pitchflower_controls.addWidget(self.flow_seed_spin)
+        self._add_button(self.pitchflower_controls, "Run PitchFlower", self.run_pitchflower)
+        self.pitchflower_controls.addWidget(QLabel("Results are measured with WORLD and overlaid as dashed pink/purple curves."))
+        self.pitchflower_controls.addStretch()
+        layout.addLayout(self.pitchflower_controls)
+        self._set_pitchflower_controls_visible(False)
+        for control in (self.flow_steps_spin, self.flow_guidance_spin, self.flow_seed_spin):
+            control.valueChanged.connect(self.pitchflower_settings_changed)
 
         self.pitch=PitchCanvas()
         self.pitch.on_begin_edit=self._snapshot
@@ -640,6 +689,86 @@ class Editor(QMainWindow):
             action.triggered.connect(callback)
             self.addAction(action)
 
+    def _set_pitchflower_controls_visible(self, visible: bool):
+        for index in range(self.pitchflower_controls.count()):
+            item = self.pitchflower_controls.itemAt(index)
+            if item.widget():
+                item.widget().setVisible(visible)
+
+    def _capture_interface_state(self):
+        if not self.engine:
+            return
+        self.interface_states[self.interface_name] = {
+            "left": self.pitch.left.copy(), "right": self.pitch.right.copy(),
+            "left_breaks": tuple(self.pitch.segment_breaks[LEFT]),
+            "right_breaks": tuple(self.pitch.segment_breaks[RIGHT]),
+            "result": self.cached_result_f0,
+            "point_spacing_ms": float(self.spacing_spin.value()),
+            "steps": int(self.flow_steps_spin.value()),
+            "guidance": float(self.flow_guidance_spin.value()),
+            "seed": int(self.flow_seed_spin.value()),
+        }
+
+    def pitchflower_settings_changed(self, _value):
+        if self.interface_name != "pitchflower" or not self.engine:
+            return
+        self.revision += 1
+        self.cache_revision = -1
+        self.cached_result_f0 = None
+        self.pitch.set_result(None, None)
+        self.interface_states["pitchflower"]["result"] = None
+        self.statusBar().showMessage("PitchFlower settings changed; click Run PitchFlower to generate new audio.")
+
+    def run_pitchflower(self):
+        if self.interface_name != "pitchflower" or not self.engine:
+            return
+        self.revision += 1
+        self.cache_revision = -1
+        self.cached_stereo = None
+        self.cached_result_f0 = None
+        self.pitch.set_result(None, None)
+        self.interface_states["pitchflower"]["result"] = None
+        self.timer.stop()
+        self.start_render()
+        self.statusBar().showMessage("Running independent left and right PitchFlower synthesis…")
+
+    def switch_interface(self, index: int):
+        name = "praat" if index == 0 else "pitchflower"
+        if name == self.interface_name or not self.engines:
+            return
+        if name not in self.engines:
+            QMessageBox.warning(self, "PitchFlower unavailable", self.interface_errors.get(name, "PitchFlower is unavailable."))
+            self.interface_tabs.blockSignals(True)
+            self.interface_tabs.setCurrentIndex(0)
+            self.interface_tabs.blockSignals(False)
+            return
+        self._capture_interface_state()
+        self.stop_audio()
+        self.interface_name = name
+        self.engine = self.engines[name]
+        state = self.interface_states[name]
+        self.pitch.set_data(self.engine.initial_pitch, self.engine.duration,
+                            20 if name == "pitchflower" else self.engine.floor,
+                            800 if name == "pitchflower" else self.engine.ceiling)
+        self.pitch.set_points(LEFT, state["left"], state["left_breaks"])
+        self.pitch.set_points(RIGHT, state["right"], state["right_breaks"])
+        result = state.get("result")
+        self.cached_result_f0 = result
+        self.pitch.set_result(*(result if result else (None, None)))
+        self.spacing_spin.setValue(state.get("point_spacing_ms", 20))
+        self.flow_steps_spin.setValue(state.get("steps", 100))
+        self.flow_guidance_spin.setValue(state.get("guidance", 2.0))
+        self.flow_seed_spin.setValue(state.get("seed", 0))
+        self.cached_stereo = None
+        self.cache_revision = -1
+        # A pending render belongs to the previously selected interface; its
+        # completion must not replace the newly selected interface's audio.
+        self.revision += 1
+        self.timeline.set_audio(self.engine.samples, self.engine.sr)
+        self.filename.setText(f"{Path(self.engine.path).name}  |  {self.engine.duration:.2f}s  |  {name.title()}")
+        self._set_pitchflower_controls_visible(name == "pitchflower")
+        self.statusBar().showMessage(f"Switched to {name.title()}; its F0 curves are independent from the other interface.")
+
     def choose_audio(self):
         file,_=QFileDialog.getOpenFileName(self,"Open recording",str(Path.home()),
                                            "Audio (*.wav *.flac *.aif *.aiff *.ogg);;All files (*)")
@@ -655,10 +784,37 @@ class Editor(QMainWindow):
             if floor>=ceiling:
                 raise ValueError("Pitch ceiling must exceed pitch floor")
             new_engine=PraatEngine(path,floor,ceiling)
+            new_engines: dict[str, object] = {"praat": new_engine}
+            errors: dict[str, str] = {}
+            try:
+                new_engines["pitchflower"] = PitchFlowerEngine(path)
+            except Exception as exc:
+                # The editor stays usable for Praat if the optional neural
+                # stack is missing or the source exceeds its verified limit.
+                errors["pitchflower"] = str(exc)
             self.session+=1
+            self.engines=new_engines
+            self.interface_errors=errors
+            self.interface_name="praat"
             self.engine=new_engine
+            self.interface_states={}
+            praat_breaks=infer_segment_breaks(new_engine.initial_pitch)
+            self.interface_states["praat"]={
+                "left":new_engine.initial_pitch.copy(), "right":new_engine.initial_pitch.copy(),
+                "left_breaks":praat_breaks, "right_breaks":praat_breaks, "result":None,
+                "point_spacing_ms":20.0, "steps":100, "guidance":2.0, "seed":0,
+            }
+            if "pitchflower" in new_engines:
+                pf=new_engines["pitchflower"]
+                pf_breaks=infer_segment_breaks(pf.initial_pitch)
+                self.interface_states["pitchflower"]={
+                    "left":pf.initial_pitch.copy(), "right":pf.initial_pitch.copy(),
+                    "left_breaks":pf_breaks, "right_breaks":pf_breaks, "result":None,
+                    "point_spacing_ms":20.0, "steps":100, "guidance":2.0, "seed":0,
+                }
             self.revision=0
             self.cached_stereo=None
+            self.cached_result_f0=None
             self.cache_revision=-1
             self.render_inflight=False  # stale jobs are ignored by session ID
             self.pending_play=None
@@ -666,6 +822,7 @@ class Editor(QMainWindow):
             self.undo_stack.clear()
             self.redo_stack.clear()
             self.pitch.set_data(new_engine.initial_pitch,new_engine.duration,floor,ceiling)
+            self.pitch.set_result(None, None)
             self.timeline.set_audio(new_engine.samples,new_engine.sr)
             self.insert_time_spin.setRange(0.0, new_engine.duration)
             self.insert_time_spin.setValue(new_engine.duration/2)
@@ -679,6 +836,10 @@ class Editor(QMainWindow):
             self.statusBar().showMessage(f"Detected {len(new_engine.initial_pitch)} Praat F0 points. "
                 "Select a contour, drag points, then click the bottom playback ruler.")
             self.start_render()
+            self.interface_tabs.blockSignals(True)
+            self.interface_tabs.setCurrentIndex(0)
+            self.interface_tabs.blockSignals(False)
+            self._set_pitchflower_controls_visible(False)
             if len(new_engine.initial_pitch)==0:
                 QMessageBox.warning(self,"No detected F0","Praat found no voiced pitch points. "
                     "Try changing the pitch analysis range. Adding points alone cannot make unvoiced audio voiced.")
@@ -713,8 +874,12 @@ class Editor(QMainWindow):
         if not self.engine:return
         self.revision+=1
         self.cache_revision=-1
+        self.cached_result_f0=None
+        self.pitch.set_result(None, None)
+        if self.interface_name in self.interface_states:
+            self.interface_states[self.interface_name]["result"] = None
         self.timer.start()
-        self.statusBar().showMessage("Pitch changed; preparing updated Praat overlap-add stereo…")
+        self.statusBar().showMessage(f"Pitch changed; preparing updated {self.interface_name.title()} stereo…")
 
     def undo(self):
         if not self.undo_stack or not self.engine:return
@@ -868,7 +1033,14 @@ class Editor(QMainWindow):
         left=self.pitch.left.copy()
         right=self.pitch.right.copy()
         self.render_inflight=True
-        future=self.executor.submit(engine.stereo,left,right)
+        if self.interface_name == "pitchflower":
+            future=self.executor.submit(
+                engine.stereo, left, right,
+                steps=int(self.flow_steps_spin.value()), guidance=float(self.flow_guidance_spin.value()),
+                seed=int(self.flow_seed_spin.value()),
+            )
+        else:
+            future=self.executor.submit(engine.stereo,left,right)
         def done(future):
             try:
                 result=future.result()
@@ -891,9 +1063,18 @@ class Editor(QMainWindow):
             # Last edit wins. Don't play stale stereo after a new drag.
             self.start_render()
             return
-        self.cached_stereo=audio
+        if isinstance(audio, PitchFlowerResult):
+            self.cached_stereo=audio.stereo
+            self.cached_result_f0=(audio.left_result_f0, audio.right_result_f0)
+            self.pitch.set_result(*self.cached_result_f0)
+            self.interface_states[self.interface_name]["result"] = self.cached_result_f0
+        else:
+            self.cached_stereo=audio
+            self.cached_result_f0=None
+            self.pitch.set_result(None, None)
         self.cache_revision=revision
-        self.statusBar().showMessage(f"Stereo ready: left (orange) + right (blue), {self.engine.sr} Hz")
+        self.statusBar().showMessage(
+            f"{self.interface_name.title()} stereo ready: left (orange) + right (blue), {self.engine.sr} Hz")
         if self.pending_export:
             filename=self.pending_export
             self.pending_export=None
@@ -1009,21 +1190,33 @@ class Editor(QMainWindow):
         file,_=QFileDialog.getSaveFileName(self,"Save editing project",str(suggested),"JSON (*.json)")
         if not file:return
         try:
-            data={
-                "format":"dichotic-praat-editor-v1",
-                "audio_path":os.path.relpath(self.engine.path,Path(file).parent),
-                "pitch_floor_hz":self.engine.floor,
-                "pitch_ceiling_hz":self.engine.ceiling,
-                "left_pitch_points":self.pitch.left.tolist(),
-                "right_pitch_points":self.pitch.right.tolist(),
-                "left_segment_starts":list(self.pitch.segment_breaks[LEFT]),
-                "right_segment_starts":list(self.pitch.segment_breaks[RIGHT]),
-                "point_spacing_ms":float(self.spacing_spin.value()),
-                "white_noise_percent":int(self.noise_slider.value()),
-                "white_noise_in_export":bool(self.noise_export_check.isChecked()),
-                "active":self.pitch.active,
-                "selection":self.timeline.selection,
-            }
+            self._capture_interface_state()
+            interfaces={}
+            for name, state in self.interface_states.items():
+                engine=self.engines[name]
+                result=state.get("result")
+                interfaces[name]={
+                    "version":1,
+                    "left_pitch_points":state["left"].tolist(),
+                    "right_pitch_points":state["right"].tolist(),
+                    "left_segment_starts":list(state["left_breaks"]),
+                    "right_segment_starts":list(state["right_breaks"]),
+                    "point_spacing_ms":state.get("point_spacing_ms",20.0),
+                    "settings":({"pitch_floor_hz":engine.floor,"pitch_ceiling_hz":engine.ceiling}
+                                 if name=="praat" else
+                                 {"flow_steps":state.get("steps",100),"guidance":state.get("guidance",2.0),"seed":state.get("seed",0)}),
+                    "result":None if result is None else {
+                        "left_measured_f0":result[0].tolist(), "right_measured_f0":result[1].tolist(),
+                    },
+                }
+            data=new_project(
+                self.engine.path, file,
+                shared={"active_interface":self.interface_name, "active_contour":self.pitch.active,
+                        "white_noise_percent":int(self.noise_slider.value()),
+                        "white_noise_in_export":bool(self.noise_export_check.isChecked()),
+                        "selection":self.timeline.selection},
+                engines=interfaces,
+            )
             Path(file).write_text(json.dumps(data,indent=2),encoding="utf-8")
             self.statusBar().showMessage(f"Saved project: {file}")
         except Exception as exc:self._error("Could not save project",exc)
@@ -1034,28 +1227,56 @@ class Editor(QMainWindow):
 
     def open_project(self,file:str):
         try:
-            data=json.loads(Path(file).read_text(encoding="utf-8"))
-            if data.get("format")!="dichotic-praat-editor-v1":
-                raise ValueError("Not a Dichotic Praat Editor v1 project")
-            path=str((Path(file).parent/data["audio_path"]).resolve())
-            self.open_audio(path,data["pitch_floor_hz"],data["pitch_ceiling_hz"])
-            if self.engine is None or self.engine.path!=path:return
-            left=checked_points(np.array(data["left_pitch_points"],dtype=float),0,self.engine.duration)
-            right=checked_points(np.array(data["right_pitch_points"],dtype=float),0,self.engine.duration)
-            self.pitch.set_points(LEFT, left, data.get("left_segment_starts", infer_segment_breaks(left)))
-            self.pitch.set_points(RIGHT, right, data.get("right_segment_starts", infer_segment_breaks(right)))
-            self.pitch.set_active(data.get("active",LEFT))
-            self.spacing_spin.setValue(float(data.get("point_spacing_ms", 20)))
-            self.noise_slider.setValue(int(data.get("white_noise_percent", 0)))
-            self.noise_export_check.setChecked(bool(data.get("white_noise_in_export", False)))
-            selection=data.get("selection")
+            data=migrate_legacy(json.loads(Path(file).read_text(encoding="utf-8")))
+            if data.get("format")!=PROJECT_FORMAT:
+                raise ValueError("Not a supported Dichotic Editor project")
+            path=resolve_audio_path(file,data)
+            praat_data=data.get("interfaces",{}).get("praat") or {}
+            settings=praat_data.get("settings",praat_data)
+            self.open_audio(path,settings.get("pitch_floor_hz",75),settings.get("pitch_ceiling_hz",600))
+            if self.engine is None:return
+            for name, payload in data.get("interfaces",{}).items():
+                if not payload or name not in self.engines:
+                    continue
+                target=self.engines[name]
+                left=checked_points(np.array(payload["left_pitch_points"],dtype=float),0,target.duration)
+                right=checked_points(np.array(payload["right_pitch_points"],dtype=float),0,target.duration)
+                measured=payload.get("result")
+                result=None if not measured else (
+                    np.asarray(measured.get("left_measured_f0",[]),dtype=float).reshape((-1,2)),
+                    np.asarray(measured.get("right_measured_f0",[]),dtype=float).reshape((-1,2)),
+                )
+                ps=payload.get("settings",{})
+                self.interface_states[name].update({
+                    "left":left,"right":right,
+                    "left_breaks":tuple(payload.get("left_segment_starts",infer_segment_breaks(left))),
+                    "right_breaks":tuple(payload.get("right_segment_starts",infer_segment_breaks(right))),
+                    "result":result,"point_spacing_ms":float(payload.get("point_spacing_ms",20)),
+                    "steps":int(ps.get("flow_steps",100)),"guidance":float(ps.get("guidance",2.0)),
+                    "seed":int(ps.get("seed",0)),
+                })
+            shared=data.get("shared",{})
+            self.noise_slider.setValue(int(shared.get("white_noise_percent", 0)))
+            self.noise_export_check.setChecked(bool(shared.get("white_noise_in_export", False)))
+            selection=shared.get("selection")
             if selection:
                 a,b=map(float,selection)
                 if 0<=a<b<=self.engine.duration:
                     self.timeline.selection=(a,b)
                     self.use_selection.setChecked(True)
-            self.pitch.update()
-            self.commit()
+            active=shared.get("active_interface","praat")
+            self.interface_tabs.setCurrentIndex(0 if active=="praat" else 1)
+            if active=="praat":
+                state=self.interface_states["praat"]
+                self.pitch.set_points(LEFT,state["left"],state["left_breaks"])
+                self.pitch.set_points(RIGHT,state["right"],state["right_breaks"])
+                self.cached_result_f0=state.get("result")
+                self.pitch.set_result(*(self.cached_result_f0 or (None,None)))
+            self.pitch.set_active(shared.get("active_contour",LEFT))
+            # Saved result F0 remains visible as provenance. Audio itself is
+            # intentionally not embedded and will be re-rendered on playback.
+            self.revision += 1
+            self.cache_revision = -1
             self.statusBar().showMessage(f"Loaded project: {file}")
         except Exception as exc:self._error("Could not load project",exc)
 

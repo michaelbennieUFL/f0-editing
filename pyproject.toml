@@ -11,15 +11,29 @@ dependencies = [
     "soundfile>=0.12,<1",
 ]
 
+[project.optional-dependencies]
+pitchflower = [
+    "pitchflower>=0.1.0",
+    "huggingface-hub>=0.24",
+    "scipy>=1.11",
+]
+
 [project.scripts]
 dichotic-praat-editor = "dichotic_editor:main"
+dichotic-editor = "dichotic_editor:main"
 
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["dichotic_editor", "praat_backend"]
+py-modules = ["dichotic_editor", "praat_backend", "render_cli"]
+
+[tool.setuptools.packages.find]
+include = ["dichotic*"]
+
+[tool.uv.sources]
+pitchflower = { path = "external/PitchFlower", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

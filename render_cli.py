@@ -12,6 +12,7 @@ import numpy as np
 import soundfile as sf
 
 from praat_backend import PraatEngine, checked_points, mix_white_noise
+from dichotic.project import PROJECT_FORMAT, migrate_legacy
 
 
 def main():
@@ -29,17 +30,19 @@ def main():
     obj=None
     if args.project:
         import json
-        obj=json.loads(Path(args.project).read_text(encoding="utf-8"))
-        if obj.get("format")!="dichotic-praat-editor-v1":
+        obj=migrate_legacy(json.loads(Path(args.project).read_text(encoding="utf-8")))
+        if obj.get("format") != PROJECT_FORMAT or not obj.get("interfaces", {}).get("praat"):
             parser.error("Invalid project format")
-    floor=args.pitch_floor if args.pitch_floor is not None else (obj["pitch_floor_hz"] if obj else 75)
-    ceiling=args.pitch_ceiling if args.pitch_ceiling is not None else (obj["pitch_ceiling_hz"] if obj else 600)
+    praat = obj["interfaces"]["praat"] if obj else None
+    settings = praat.get("settings", praat) if praat else {}
+    floor=args.pitch_floor if args.pitch_floor is not None else settings.get("pitch_floor_hz", 75)
+    ceiling=args.pitch_ceiling if args.pitch_ceiling is not None else settings.get("pitch_ceiling_hz", 600)
     engine=PraatEngine(args.input,floor,ceiling)
     left=engine.initial_pitch.copy()
     right=engine.initial_pitch.copy()
     if obj:
-        left=checked_points(np.asarray(obj["left_pitch_points"],dtype=float),0,engine.duration)
-        right=checked_points(np.asarray(obj["right_pitch_points"],dtype=float),0,engine.duration)
+        left=checked_points(np.asarray(praat["left_pitch_points"],dtype=float),0,engine.duration)
+        right=checked_points(np.asarray(praat["right_pitch_points"],dtype=float),0,engine.duration)
     left[:,1]*=2**(args.left_semitones/12)
     right[:,1]*=2**(args.right_semitones/12)
     stereo=engine.stereo(left,right)
