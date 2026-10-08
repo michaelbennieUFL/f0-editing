@@ -1,0 +1,25 @@
+[project]
+name = "dichotic-praat-editor"
+version = "0.2.0"
+description = "Two-channel Praat overlap-add F0 editor with dichotic playback"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "numpy>=1.26,<3",
+    "praat-parselmouth>=0.4.6,<0.6",
+    "PyQt6>=6.6,<7",
+    "sounddevice>=0.5,<1",
+    "soundfile>=0.12,<1",
+]
+
+[project.scripts]
+dichotic-praat-editor = "dichotic_editor:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["dichotic_editor", "praat_backend"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
