@@ -1,3 +1,6 @@
 [submodule "external/PitchFlower"]
 	path = external/PitchFlower
 	url = https://github.com/diegotg2000/PitchFlower.git
+[submodule "external/promonet"]
+	path = external/promonet
+	url = https://github.com/maxrmorrison/promonet
