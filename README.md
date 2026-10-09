@@ -7,6 +7,8 @@ The editor has independent synthesis-interface tabs:
 
 Both tabs share the timeline, dichotic playback modes, exports, undoable contour editing, and one versioned project file. Generated PitchFlower F0 is shown as a dashed result overlay and never overwrites either editable curve. PitchFlower works at 24 kHz and reports an error when resampled source audio exceeds its supported duration.
 
+The pitch floor and ceiling fields apply to whichever interface is reanalyzed, including PitchFlower's WORLD contour. After rendering, the waveform timeline shows the generated left/right RMS envelopes and reports their RMS and dBFS values. **Match generated channel RMS to source** equalizes the two interface outputs toward the source level, **Output gain** applies a final gain, and **Peak ceiling** applies a shared limiter to reduce high-level ringing and clipping. These controls change level only; they do not change F0 contours. Echo-like temporal artifacts originate in the resynthesis model and may require changing the F0 edit, Praat analysis range, or PitchFlower flow settings rather than gain matching alone.
+
 Install the optional neural stack before selecting its tab:
 
 ```bash

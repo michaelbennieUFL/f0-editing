@@ -276,3 +276,39 @@ def mix_white_noise(audio: np.ndarray, level_percent: float, reference_rms: floa
         # Uniform attenuation avoids clipping without changing stereo balance.
         combined *= 0.99 / peak
     return combined.astype(np.float32)
+
+
+def normalize_stereo_levels(audio: np.ndarray, reference: np.ndarray, *,
+                            match_rms: bool = True, gain_db: float = 0.0,
+                            peak_dbfs: float = -1.0, max_channel_gain_db: float = 12.0
+                            ) -> np.ndarray:
+    """Make generated channels comparable while preserving their F0 content.
+
+    Each channel can be matched to the source RMS, but gain is bounded so a
+    nearly silent/unstable render cannot be amplified without limit. A shared
+    peak guard then controls high-level ringing and prevents clipping.
+    """
+    result = np.asarray(audio, dtype=np.float64).reshape((-1, 2)).copy()
+    source = np.asarray(reference, dtype=np.float64).reshape(-1)
+    if result.size == 0:
+        return result.astype(np.float32)
+    if not np.isfinite(gain_db) or not np.isfinite(peak_dbfs):
+        raise ValueError("Output gain and peak ceiling must be finite")
+    if peak_dbfs > 0:
+        raise ValueError("Peak ceiling must be at or below 0 dBFS")
+    if max_channel_gain_db < 0:
+        raise ValueError("Maximum channel gain must be nonnegative")
+    if match_rms:
+        target = float(np.sqrt(np.mean(np.square(source)))) if source.size else 0.0
+        if target > 1e-9:
+            limit = 10 ** (float(max_channel_gain_db) / 20.0)
+            for channel in range(2):
+                current = float(np.sqrt(np.mean(np.square(result[:, channel]))))
+                if current > 1e-9:
+                    result[:, channel] *= np.clip(target / current, 1.0 / limit, limit)
+    result *= 10 ** (float(gain_db) / 20.0)
+    ceiling = 10 ** (float(peak_dbfs) / 20.0)
+    peak = float(np.max(np.abs(result)))
+    if peak > ceiling > 0:
+        result *= ceiling / peak
+    return np.clip(result, -ceiling, ceiling).astype(np.float32)

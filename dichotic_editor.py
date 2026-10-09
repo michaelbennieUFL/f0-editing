@@ -46,7 +46,7 @@ GRID = QColor("#e5ebf2")
 from praat_backend import (
     PraatEngine, checked_points, infer_segment_breaks, normalize_breaks,
     resample_editable_pitch, insert_editable_point, delete_editable_point,
-    simplify_segmented_pitch, mix_white_noise,
+    simplify_segmented_pitch, mix_white_noise, normalize_stereo_levels,
 )
 from dichotic.project import PROJECT_FORMAT, migrate_legacy, new_project, resolve_audio_path
 from dichotic.interfaces.pitchflower import PitchFlowerEngine, PitchFlowerResult
@@ -333,6 +333,9 @@ class WaveTimeline(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.duration = 1.0
         self.waveform = np.zeros(2)
+        self.generated_stereo: np.ndarray | None = None
+        self.rms_times = np.empty(0, dtype=float)
+        self.rms_values = np.empty((0, 2), dtype=float)
         self._select_start: float | None = None
         self.selection: tuple[float, float] | None = None
         self._dragging = False
@@ -341,11 +344,30 @@ class WaveTimeline(QWidget):
         self.margin_r = 20
         self.playbar_h = 40
 
-    def set_audio(self, mono: np.ndarray, rate: int):
+    def set_audio(self, mono: np.ndarray, rate: int, generated: np.ndarray | None = None):
         self.duration = len(mono) / rate
         self.waveform = np.asarray(mono, dtype=float)
+        self.set_generated(generated, rate)
         self.selection = None
         self.cursor = 0
+        self.update()
+
+    def set_generated(self, stereo: np.ndarray | None, rate: int):
+        self.generated_stereo = None if stereo is None else np.asarray(stereo, dtype=float).reshape((-1, 2))
+        if self.generated_stereo is None or len(self.generated_stereo) == 0:
+            self.rms_times = np.empty(0, dtype=float)
+            self.rms_values = np.empty((0, 2), dtype=float)
+            self.update()
+            return
+        width = max(32, min(800, self.width() or 400))
+        block = max(1, int(np.ceil(len(self.generated_stereo) / width)))
+        count = int(np.ceil(len(self.generated_stereo) / block))
+        values = np.zeros((count, 2), dtype=float)
+        for index in range(count):
+            chunk = self.generated_stereo[index * block:(index + 1) * block]
+            values[index] = np.sqrt(np.mean(np.square(chunk), axis=0))
+        self.rms_values = values
+        self.rms_times = (np.arange(count) * block + block / 2) / rate
         self.update()
 
     def _x(self, time_s: float) -> float:
@@ -377,6 +399,27 @@ class WaveTimeline(QWidget):
                 ymax = float(np.max(window))
                 peakscale = wav_h * 0.45 / scale
                 p.drawLine(QPointF(left+i, midy-ymin*peakscale), QPointF(left+i, midy-ymax*peakscale))
+        if len(self.rms_values):
+            source_scale = max(float(np.max(np.abs(waveform))), 0.01)
+            rms_scale = wav_h * 0.45 / source_scale
+            width = max(1, int(right - left))
+            # Show generated left/right RMS as colored envelopes over the
+            # waveform. The labels report absolute RMS and dBFS.
+            for channel, color, baseline_sign, label in (
+                (0, QColor("#d47724"), -1.0, "L"),
+                (1, QColor("#287ac4"), 1.0, "R"),
+            ):
+                p.setPen(QPen(color, 2))
+                points = []
+                for x in range(width):
+                    t = (x / max(1, width - 1)) * self.duration
+                    rms = float(np.interp(t, self.rms_times, self.rms_values[:, channel], left=self.rms_values[0, channel], right=self.rms_values[-1, channel]))
+                    points.append(QPointF(left + x, midy + baseline_sign * rms * rms_scale))
+                for first, second in zip(points, points[1:]):
+                    p.drawLine(first, second)
+                mean_rms = float(np.sqrt(np.mean(np.square(self.generated_stereo[:, channel]))))
+                db = 20 * np.log10(max(mean_rms, 1e-9))
+                p.drawText(QRectF(left + 8, 5 + channel * 16, 250, 16), f"RMS {label}: {mean_rms:.4f} ({db:.1f} dBFS)")
         if self.selection is not None:
             a,b = self.selection
             srect = QRectF(self._x(a), 1, max(1,self._x(b)-self._x(a)), self.height()-self.playbar_h-2)
@@ -465,6 +508,7 @@ class Editor(QMainWindow):
         self.revision=0
         self.cache_revision=-1
         self.cached_stereo: np.ndarray | None=None
+        self.raw_stereo: np.ndarray | None=None
         self.render_inflight=False
         self.pending_play: PlaybackRequest | None=None
         self.pending_export: str | None=None
@@ -651,6 +695,25 @@ class Editor(QMainWindow):
         noise_controls.addWidget(self.noise_export_check)
         layout.addLayout(noise_controls)
 
+        level_controls=QHBoxLayout()
+        self.level_match_check=QCheckBox("Match generated channel RMS to source")
+        self.level_match_check.setChecked(True)
+        level_controls.addWidget(self.level_match_check)
+        level_controls.addWidget(QLabel("Output gain"))
+        self.output_gain_spin=self._spin(0.0,-24.0,12.0,0.5,decimals=1)
+        self.output_gain_spin.setSuffix(" dB")
+        level_controls.addWidget(self.output_gain_spin)
+        level_controls.addWidget(QLabel("Peak ceiling"))
+        self.peak_ceiling_spin=self._spin(-1.0,-24.0,0.0,0.5,decimals=1)
+        self.peak_ceiling_spin.setSuffix(" dBFS")
+        level_controls.addWidget(self.peak_ceiling_spin)
+        level_controls.addWidget(QLabel("RMS envelopes appear over the waveform after rendering."))
+        level_controls.addStretch()
+        layout.addLayout(level_controls)
+        self.level_match_check.toggled.connect(self._output_levels_changed)
+        self.output_gain_spin.valueChanged.connect(self._output_levels_changed)
+        self.peak_ceiling_spin.valueChanged.connect(self._output_levels_changed)
+
         hint=QLabel("Orange ▼ = LEFT F0    •    Blue ▲ = RIGHT F0    •    Gray dashed = untouched original reference. "
                     "Double-click to add to active track; Shift+double-click adds LEFT and Ctrl+double-click adds RIGHT. "
                     "Regenerate samples the CURRENT edited curves, not original analysis. "
@@ -703,6 +766,8 @@ class Editor(QMainWindow):
             "left_breaks": tuple(self.pitch.segment_breaks[LEFT]),
             "right_breaks": tuple(self.pitch.segment_breaks[RIGHT]),
             "result": self.cached_result_f0,
+            "audio": self.cached_stereo,
+            "raw_audio": self.raw_stereo,
             "point_spacing_ms": float(self.spacing_spin.value()),
             "steps": int(self.flow_steps_spin.value()),
             "guidance": float(self.flow_guidance_spin.value()),
@@ -715,7 +780,9 @@ class Editor(QMainWindow):
         self.revision += 1
         self.cache_revision = -1
         self.cached_result_f0 = None
+        self.raw_stereo = None
         self.pitch.set_result(None, None)
+        self.timeline.set_generated(None, self.engine.sr)
         self.interface_states["pitchflower"]["result"] = None
         self.statusBar().showMessage("PitchFlower settings changed; click Run PitchFlower to generate new audio.")
 
@@ -725,8 +792,10 @@ class Editor(QMainWindow):
         self.revision += 1
         self.cache_revision = -1
         self.cached_stereo = None
+        self.raw_stereo = None
         self.cached_result_f0 = None
         self.pitch.set_result(None, None)
+        self.timeline.set_generated(None, self.engine.sr)
         self.interface_states["pitchflower"]["result"] = None
         self.timer.stop()
         self.start_render()
@@ -748,8 +817,7 @@ class Editor(QMainWindow):
         self.engine = self.engines[name]
         state = self.interface_states[name]
         self.pitch.set_data(self.engine.initial_pitch, self.engine.duration,
-                            20 if name == "pitchflower" else self.engine.floor,
-                            800 if name == "pitchflower" else self.engine.ceiling)
+                            self.engine.floor, self.engine.ceiling)
         self.pitch.set_points(LEFT, state["left"], state["left_breaks"])
         self.pitch.set_points(RIGHT, state["right"], state["right_breaks"])
         result = state.get("result")
@@ -759,12 +827,13 @@ class Editor(QMainWindow):
         self.flow_steps_spin.setValue(state.get("steps", 100))
         self.flow_guidance_spin.setValue(state.get("guidance", 2.0))
         self.flow_seed_spin.setValue(state.get("seed", 0))
-        self.cached_stereo = None
+        self.raw_stereo = state.get("raw_audio")
+        self.cached_stereo = state.get("audio")
         self.cache_revision = -1
         # A pending render belongs to the previously selected interface; its
         # completion must not replace the newly selected interface's audio.
         self.revision += 1
-        self.timeline.set_audio(self.engine.samples, self.engine.sr)
+        self.timeline.set_audio(self.engine.samples, self.engine.sr, state.get("audio"))
         self.filename.setText(f"{Path(self.engine.path).name}  |  {self.engine.duration:.2f}s  |  {name.title()}")
         self._set_pitchflower_controls_visible(name == "pitchflower")
         self.statusBar().showMessage(f"Switched to {name.title()}; its F0 curves are independent from the other interface.")
@@ -787,7 +856,7 @@ class Editor(QMainWindow):
             new_engines: dict[str, object] = {"praat": new_engine}
             errors: dict[str, str] = {}
             try:
-                new_engines["pitchflower"] = PitchFlowerEngine(path)
+                new_engines["pitchflower"] = PitchFlowerEngine(path, floor, ceiling)
             except Exception as exc:
                 # The editor stays usable for Praat if the optional neural
                 # stack is missing or the source exceeds its verified limit.
@@ -801,7 +870,7 @@ class Editor(QMainWindow):
             praat_breaks=infer_segment_breaks(new_engine.initial_pitch)
             self.interface_states["praat"]={
                 "left":new_engine.initial_pitch.copy(), "right":new_engine.initial_pitch.copy(),
-                "left_breaks":praat_breaks, "right_breaks":praat_breaks, "result":None,
+                "left_breaks":praat_breaks, "right_breaks":praat_breaks, "result":None, "audio":None,
                 "point_spacing_ms":20.0, "steps":100, "guidance":2.0, "seed":0,
             }
             if "pitchflower" in new_engines:
@@ -809,11 +878,12 @@ class Editor(QMainWindow):
                 pf_breaks=infer_segment_breaks(pf.initial_pitch)
                 self.interface_states["pitchflower"]={
                     "left":pf.initial_pitch.copy(), "right":pf.initial_pitch.copy(),
-                    "left_breaks":pf_breaks, "right_breaks":pf_breaks, "result":None,
+                    "left_breaks":pf_breaks, "right_breaks":pf_breaks, "result":None, "audio":None,
                     "point_spacing_ms":20.0, "steps":100, "guidance":2.0, "seed":0,
                 }
             self.revision=0
             self.cached_stereo=None
+            self.raw_stereo=None
             self.cached_result_f0=None
             self.cache_revision=-1
             self.render_inflight=False  # stale jobs are ignored by session ID
@@ -853,7 +923,7 @@ class Editor(QMainWindow):
                 "Reanalysis replaces both edited contours. Continue?",
                 QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)
             if result != QMessageBox.StandardButton.Yes:return
-        self.open_audio(self.engine.path)
+        self.open_audio(self.engine.path, float(self.floor_spin.value()), float(self.ceiling_spin.value()))
 
     def _pitch_state(self):
         return (self.pitch.left.copy(), self.pitch.right.copy(),
@@ -875,6 +945,11 @@ class Editor(QMainWindow):
         self.revision+=1
         self.cache_revision=-1
         self.cached_result_f0=None
+        self.raw_stereo=None
+        self.timeline.set_generated(None, self.engine.sr)
+        if self.interface_name in self.interface_states:
+            self.interface_states[self.interface_name]["audio"] = None
+            self.interface_states[self.interface_name]["raw_audio"] = None
         self.pitch.set_result(None, None)
         if self.interface_name in self.interface_states:
             self.interface_states[self.interface_name]["result"] = None
@@ -1051,27 +1126,48 @@ class Editor(QMainWindow):
             self.signals.ready.emit(session,revision,result,error)
         future.add_done_callback(done)
 
+    def _output_levels_changed(self, _value=None):
+        if self.raw_stereo is None or self.engine is None:
+            return
+        self._refresh_output_audio()
+
+    def _refresh_output_audio(self):
+        if self.raw_stereo is None or self.engine is None:
+            return
+        self.cached_stereo = normalize_stereo_levels(
+            self.raw_stereo,
+            self.engine.samples,
+            match_rms=self.level_match_check.isChecked(),
+            gain_db=float(self.output_gain_spin.value()),
+            peak_dbfs=float(self.peak_ceiling_spin.value()),
+        )
+        if self.interface_name in self.interface_states:
+            self.interface_states[self.interface_name]["audio"] = self.cached_stereo
+            self.interface_states[self.interface_name]["raw_audio"] = self.raw_stereo
+        self.timeline.set_generated(self.cached_stereo, self.engine.sr)
+
     def on_render_ready(self,session:int,revision:int,audio, error):
         if session!=self.session:return
         self.render_inflight=False
         if error:
             self.pending_play=None
             self.pending_export=None
-            QMessageBox.critical(self,"Praat resynthesis failed",str(error))
+            QMessageBox.critical(self, f"{self.interface_name.title()} resynthesis failed", str(error))
             return
         if revision!=self.revision:
             # Last edit wins. Don't play stale stereo after a new drag.
             self.start_render()
             return
         if isinstance(audio, PitchFlowerResult):
-            self.cached_stereo=audio.stereo
+            self.raw_stereo=audio.stereo
             self.cached_result_f0=(audio.left_result_f0, audio.right_result_f0)
             self.pitch.set_result(*self.cached_result_f0)
             self.interface_states[self.interface_name]["result"] = self.cached_result_f0
         else:
-            self.cached_stereo=audio
+            self.raw_stereo=audio
             self.cached_result_f0=None
             self.pitch.set_result(None, None)
+        self._refresh_output_audio()
         self.cache_revision=revision
         self.statusBar().showMessage(
             f"{self.interface_name.title()} stereo ready: left (orange) + right (blue), {self.engine.sr} Hz")
@@ -1214,6 +1310,9 @@ class Editor(QMainWindow):
                 shared={"active_interface":self.interface_name, "active_contour":self.pitch.active,
                         "white_noise_percent":int(self.noise_slider.value()),
                         "white_noise_in_export":bool(self.noise_export_check.isChecked()),
+                        "match_output_rms":bool(self.level_match_check.isChecked()),
+                        "output_gain_db":float(self.output_gain_spin.value()),
+                        "peak_ceiling_dbfs":float(self.peak_ceiling_spin.value()),
                         "selection":self.timeline.selection},
                 engines=interfaces,
             )
@@ -1258,6 +1357,9 @@ class Editor(QMainWindow):
             shared=data.get("shared",{})
             self.noise_slider.setValue(int(shared.get("white_noise_percent", 0)))
             self.noise_export_check.setChecked(bool(shared.get("white_noise_in_export", False)))
+            self.level_match_check.setChecked(bool(shared.get("match_output_rms", True)))
+            self.output_gain_spin.setValue(float(shared.get("output_gain_db", 0.0)))
+            self.peak_ceiling_spin.setValue(float(shared.get("peak_ceiling_dbfs", -1.0)))
             selection=shared.get("selection")
             if selection:
                 a,b=map(float,selection)

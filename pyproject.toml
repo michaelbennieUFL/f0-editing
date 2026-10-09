@@ -16,6 +16,9 @@ pitchflower = [
     "pitchflower>=0.1.0",
     "huggingface-hub>=0.24",
     "scipy>=1.11",
+    # pyworld 0.3.5 imports the legacy pkg_resources module, removed by
+    # setuptools 82. Keep the neural extra compatible until pyworld updates.
+    "setuptools<81",
 ]
 
 [project.scripts]
