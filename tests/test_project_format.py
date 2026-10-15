@@ -30,3 +30,16 @@ def test_v2_project_keeps_engine_payloads_separate(tmp_path):
     assert project["format"] == PROJECT_FORMAT
     assert project["interfaces"]["praat"]["left_pitch_points"] == [[0, 100]]
     assert project["interfaces"]["pitchflower"]["left_pitch_points"] == [[0, 200]]
+
+
+def test_project_can_store_independent_promonet_settings(tmp_path):
+    project = new_project(
+        str(tmp_path / "input.wav"), str(tmp_path / "edit.json"),
+        shared={"active_interface": "promonet"},
+        engines={"promonet": {"left_pitch_points": [[0, 200]],
+                                "settings": {"checkpoint_mode": 1, "checkpoint_path": "adapted",
+                                             "speaker": 3, "spectral_balance": 1.1}}},
+    )
+    settings = project["interfaces"]["promonet"]["settings"]
+    assert settings["checkpoint_path"] == "adapted"
+    assert settings["speaker"] == 3

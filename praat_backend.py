@@ -240,14 +240,54 @@ def simplify_segmented_pitch(points: np.ndarray, breaks=(), tolerance_st: float 
     return np.concatenate(simplified), tuple(new_breaks)
 
 
+def _shape_noise(noise: np.ndarray, sample_rate: int, noise_type: str) -> np.ndarray:
+    """Apply a deterministic spectral profile while preserving time length."""
+    kind = str(noise_type).strip().lower().replace("-", " ")
+    aliases = {"white": "white", "white noise": "white",
+               "pink": "pink", "pink noise": "pink",
+               "stationary speech shaped": "speech",
+               "stationary speech shaped noise": "speech",
+               "speech shaped": "speech", "speech shaped noise": "speech",
+               "speech": "speech"}
+    kind = aliases.get(kind, kind)
+    if kind == "white":
+        return noise
+    if kind not in {"pink", "speech"}:
+        raise ValueError("Noise type must be White noise, Pink noise, or Stationary speech-shaped noise")
+    count = len(noise)
+    spectrum = np.fft.rfft(noise, axis=0)
+    frequencies = np.fft.rfftfreq(count, 1.0 / sample_rate)
+    if kind == "pink":
+        weight = 1.0 / np.sqrt(np.maximum(frequencies, 1.0))
+        weight[0] = weight[1] if len(weight) > 1 else 1.0
+    else:
+        # Smooth fixed long-term-average speech spectrum, in dB relative to
+        # the mid-band peak. This remains stationary and needs no extra DSP
+        # dependency.
+        base_hz = np.array([0, 250, 500, 1000, 2000, 3000, 4000, 6000, 8000, 12000], dtype=float)
+        base_db = np.array([-12, -8, -4, 0, -3, -8, -12, -18, -24, -30], dtype=float)
+        nyquist = sample_rate / 2.0
+        keep = base_hz < nyquist
+        profile_hz = np.concatenate((base_hz[keep], [nyquist]))
+        profile_db = np.concatenate((base_db[keep], [base_db[keep][-1] - 6]))
+        db = np.interp(frequencies, profile_hz, profile_db)
+        weight = np.power(10.0, db / 20.0)
+    shaped = np.fft.irfft(spectrum * weight[:, None], n=count, axis=0)
+    return shaped.astype(np.float32)
+
+
 def mix_white_noise(audio: np.ndarray, level_percent: float, reference_rms: float,
                     *, active_channels: tuple[bool, bool] = (True, True),
-                    start_sample: int = 0, seed: int = 49273) -> np.ndarray:
+                    start_sample: int = 0, seed: int = 49273,
+                    linked_channels: bool = False, noise_type: str = "White noise",
+                    sample_rate: int = 24_000) -> np.ndarray:
     """Add uncorrelated white noise to active ears, for playback or optional export.
 
     100% noise means an RMS equal to the ORIGINAL source's RMS; 0% means off.
     The fixed seed makes repeated playback from the same time reproducible.
-    Only the active ear gets noise in one-ear-only playback modes.
+    Only the active ear gets noise in one-ear-only playback modes. Set
+    ``linked_channels=True`` when stereo playback should use the same noise
+    waveform in both ears.
     """
     source = np.asarray(audio, dtype=np.float32)
     if source.ndim != 2 or source.shape[1] != 2:
@@ -260,9 +300,14 @@ def mix_white_noise(audio: np.ndarray, level_percent: float, reference_rms: floa
         return source.copy()
     gain = float(level_percent) / 100 * reference_rms
     # Seed by region start so a repeated click on the same region generates
-    # exactly the same noise; left/right channels are statistically independent.
+    # exactly the same noise. By default left/right channels are statistically
+    # independent; linked mode intentionally mirrors one noise signal to both.
     generator = np.random.default_rng(np.random.SeedSequence([int(seed), int(start_sample)]))
-    white = generator.standard_normal(source.shape)
+    if linked_channels:
+        shared = generator.standard_normal((source.shape[0], 1))
+        white = np.repeat(_shape_noise(shared, sample_rate, noise_type), 2, axis=1)
+    else:
+        white = _shape_noise(generator.standard_normal(source.shape), sample_rate, noise_type)
     mask = np.array(active_channels, dtype=bool)
     for channel in range(2):
         if mask[channel]:

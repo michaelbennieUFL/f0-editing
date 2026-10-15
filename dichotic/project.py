@@ -42,7 +42,7 @@ def migrate_legacy(data: dict[str, Any]) -> dict[str, Any]:
             "white_noise_in_export": data.get("white_noise_in_export", False),
             "selection": data.get("selection"),
         },
-        "interfaces": {"praat": praat, "pitchflower": None},
+        "interfaces": {"praat": praat, "pitchflower": None, "promonet": None},
     }
 
 

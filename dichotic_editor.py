@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QFrame, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
     QPushButton, QScrollArea, QSizePolicy, QSlider, QSplitter, QStatusBar, QVBoxLayout,
-    QWidget, QTabBar,
+    QWidget, QTabBar, QToolTip,
 )
 
 LEFT = "left"
@@ -50,6 +50,9 @@ from praat_backend import (
 )
 from dichotic.project import PROJECT_FORMAT, migrate_legacy, new_project, resolve_audio_path
 from dichotic.interfaces.pitchflower import PitchFlowerEngine, PitchFlowerResult
+from dichotic.interfaces.promonet import ProMoNetEngine, ProMoNetResult
+
+INTERFACES = ("praat", "pitchflower", "promonet")
 
 
 @dataclass
@@ -61,6 +64,21 @@ class PlaybackRequest:
 
 class WorkSignals(QObject):
     ready = pyqtSignal(int, int, object, object)  # session, revision, audio, error
+
+
+def hz_to_mel(hz: np.ndarray | float) -> np.ndarray | float:
+    """Convert Hertz to the standard mel display scale."""
+    return 2595.0 * np.log10(1.0 + np.asarray(hz) / 700.0)
+
+
+def mel_to_hz(mel: np.ndarray | float) -> np.ndarray | float:
+    """Convert the standard mel display scale back to Hertz."""
+    return 700.0 * (np.power(10.0, np.asarray(mel) / 2595.0) - 1.0)
+
+
+def perceptual_midpoint(left_hz: np.ndarray, right_hz: np.ndarray, left_weight: float = 0.5) -> np.ndarray:
+    """Blend two positive F0 contours in log-frequency (perceptual) space."""
+    return np.exp2(left_weight * np.log2(left_hz) + (1.0 - left_weight) * np.log2(right_hz))
 
 
 class PitchCanvas(QWidget):
@@ -98,6 +116,8 @@ class PitchCanvas(QWidget):
         self.margin_t = 24
         self.margin_b = 40
         self.on_begin_edit: Callable[[], None] | None = None
+        self.show_midpoints = True
+        self.mel_axis = False
 
     def set_data(self, points: np.ndarray, duration: float, low: float, high: float):
         self.left = points.copy()
@@ -130,6 +150,22 @@ class PitchCanvas(QWidget):
             self.selection_changed.emit()
             self.update()
 
+    def set_visualization(self, *, show_midpoints: bool | None = None, mel_axis: bool | None = None):
+        if show_midpoints is not None:
+            self.show_midpoints = bool(show_midpoints)
+        if mel_axis is not None:
+            self.mel_axis = bool(mel_axis)
+        self.update()
+
+    def _display_y(self, hz: np.ndarray | float) -> np.ndarray | float:
+        return hz_to_mel(hz) if self.mel_axis else hz
+
+    def _hz_from_display_y(self, value: float) -> float:
+        return float(mel_to_hz(value)) if self.mel_axis else float(value)
+
+    def _display_limits(self) -> tuple[float, float]:
+        return float(self._display_y(self.ymin)), float(self._display_y(self.ymax))
+
     def points(self, side: str | None = None) -> np.ndarray:
         return self.left if (side or self.active) == LEFT else self.right
 
@@ -149,22 +185,26 @@ class PitchCanvas(QWidget):
 
     def coord(self, x: float, y: float) -> QPointF:
         rect = self.plot_rect()
+        ymin, ymax = self._display_limits()
+        y = float(self._display_y(y))
         return QPointF(rect.left() + (x / max(self.duration, 1e-9)) * rect.width(),
-                       rect.bottom() - ((y - self.ymin) / max(self.ymax - self.ymin, 1e-9)) * rect.height())
+                       rect.bottom() - ((y - ymin) / max(ymax - ymin, 1e-9)) * rect.height())
 
     def point_data(self, x: float, y: float) -> tuple[float, float]:
         rect = self.plot_rect()
+        ymin, ymax = self._display_limits()
         xx = (x - rect.left()) / rect.width() * self.duration
-        yy = self.ymin + (rect.bottom() - y) / rect.height() * (self.ymax - self.ymin)
+        display_y = ymin + (rect.bottom() - y) / rect.height() * (ymax - ymin)
+        yy = self._hz_from_display_y(display_y)
         return float(np.clip(xx, 0, self.duration)), float(np.clip(yy, self.ymin, self.ymax))
 
     def nearest(self, pos: QPointF, radius: float = 13) -> int | None:
         tier = self.points()
         if len(tier) == 0:
             return None
-        rect = self.plot_rect()
-        px = rect.left() + tier[:, 0] * rect.width() / self.duration
-        py = rect.bottom() - (tier[:, 1] - self.ymin) * rect.height() / (self.ymax - self.ymin)
+        positions = [self.coord(float(x), float(y)) for x, y in tier]
+        px = np.asarray([position.x() for position in positions])
+        py = np.asarray([position.y() for position in positions])
         d2 = (px - pos.x())**2 + (py - pos.y())**2
         idx = int(np.argmin(d2))
         return idx if d2[idx] <= radius**2 else None
@@ -178,13 +218,16 @@ class PitchCanvas(QWidget):
         p.setPen(QPen(GRID, 1))
         p.drawRect(rect)
         # Ruler and grid.
-        f_step = 50 if self.ymax - self.ymin < 700 else 100
-        for f in np.arange(math.ceil(self.ymin / f_step) * f_step, self.ymax + 1e-6, f_step):
-            pt = self.coord(0, float(f))
+        ymin, ymax = self._display_limits()
+        f_step = (50 if self.ymax - self.ymin < 700 else 100) if not self.mel_axis else 100
+        for display_value in np.arange(math.ceil(ymin / f_step) * f_step, ymax + 1e-6, f_step):
+            f = self._hz_from_display_y(float(display_value))
+            pt = self.coord(0, f)
             p.setPen(QPen(GRID, 1))
             p.drawLine(QPointF(rect.left(), pt.y()), QPointF(rect.right(), pt.y()))
             p.setPen(MUTED)
-            p.drawText(QRectF(0, pt.y()-9, self.margin_l-8, 18), Qt.AlignmentFlag.AlignRight, f"{f:.0f}")
+            p.drawText(QRectF(0, pt.y()-9, self.margin_l-8, 18), Qt.AlignmentFlag.AlignRight,
+                       f"{display_value:.0f}")
         step = nice_time_tick(self.duration)
         for t in np.arange(0, self.duration + 1e-8, step):
             pt = self.coord(float(t), self.ymin)
@@ -194,7 +237,9 @@ class PitchCanvas(QWidget):
             p.drawText(QRectF(pt.x()-30, rect.bottom()+4, 60, 20), Qt.AlignmentFlag.AlignHCenter, f"{t:.2f}")
         p.setPen(TEXT)
         p.setFont(QFont("Sans", 10, QFont.Weight.DemiBold))
-        p.drawText(int(rect.left()), 17, "F0 (Hz)   |   Orange ▼ LEFT     Blue ▲ RIGHT     (double-click: add point)")
+        unit = "mel" if self.mel_axis else "Hz"
+        p.drawText(int(rect.left()), 17,
+                   f"F0 ({unit})   |   Orange ▼ LEFT     Blue ▲ RIGHT     (double-click: add point)")
         p.setFont(QFont("Sans", 9))
         p.setPen(MUTED)
         p.drawText(QRectF(rect.left(), rect.bottom()+23, rect.width(), 17), Qt.AlignmentFlag.AlignCenter, "Time (seconds)")
@@ -205,6 +250,8 @@ class PitchCanvas(QWidget):
         # not fed back into either editable tier.
         self._draw_tier(p, self.result_left, QColor("#d34b94"), dashed=True)
         self._draw_tier(p, self.result_right, QColor("#7654c9"), dashed=True)
+        if self.show_midpoints:
+            self._draw_midpoint_guides(p)
         for side in (RIGHT, LEFT) if self.active == LEFT else (LEFT, RIGHT):
             self._draw_tier(p, self.points(side), COLORS[side], side=side,
                             breaks=self.segment_breaks[side], foreground=(side == self.active))
@@ -249,6 +296,53 @@ class PitchCanvas(QWidget):
                 painter.drawPolygon(QPolygonF(corners))
         painter.restore()
 
+    def _overlap_segments(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Return synchronised points where both editable contours are voiced."""
+        output: list[tuple[np.ndarray, np.ndarray]] = []
+        for left_part in np.split(self.left, self.segment_breaks[LEFT]):
+            for right_part in np.split(self.right, self.segment_breaks[RIGHT]):
+                if not len(left_part) or not len(right_part):
+                    continue
+                start = max(float(left_part[0, 0]), float(right_part[0, 0]))
+                end = min(float(left_part[-1, 0]), float(right_part[-1, 0]))
+                if end <= start:
+                    continue
+                times = np.unique(np.concatenate((
+                    [start, end],
+                    left_part[(left_part[:, 0] >= start) & (left_part[:, 0] <= end), 0],
+                    right_part[(right_part[:, 0] >= start) & (right_part[:, 0] <= end), 0],
+                )))
+                left = np.interp(times, left_part[:, 0], left_part[:, 1])
+                right = np.interp(times, right_part[:, 0], right_part[:, 1])
+                output.append((times, np.column_stack((left, right))))
+        return output
+
+    def _draw_midpoint_guides(self, painter: QPainter):
+        painter.save()
+        guides = ((1 / 3, Qt.PenStyle.DotLine, QColor("#d87a7a")),
+                  (1 / 2, Qt.PenStyle.SolidLine, QColor("#d12f2f")),
+                  (2 / 3, Qt.PenStyle.DotLine, QColor("#d87a7a")))
+        for times, values in self._overlap_segments():
+            for left_weight, style, color in guides:
+                middle = perceptual_midpoint(values[:, 0], values[:, 1], left_weight)
+                pen = QPen(color, 1.2)
+                pen.setStyle(style)
+                painter.setPen(pen)
+                path = QPainterPath(self.coord(float(times[0]), float(middle[0])))
+                for time_s, f0 in zip(times[1:], middle[1:]):
+                    path.lineTo(self.coord(float(time_s), float(f0)))
+                painter.drawPath(path)
+        painter.restore()
+
+    def _cents_at(self, time_s: float) -> tuple[float, float] | None:
+        for times, values in self._overlap_segments():
+            if times[0] <= time_s <= times[-1]:
+                left = float(np.interp(time_s, times, values[:, 0]))
+                right = float(np.interp(time_s, times, values[:, 1]))
+                center = float(perceptual_midpoint(np.asarray([left]), np.asarray([right]))[0])
+                return center, 1200.0 * math.log2(right / left)
+        return None
+
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
@@ -263,6 +357,21 @@ class PitchCanvas(QWidget):
 
     def mouseMoveEvent(self, event):
         if not self._dragging or self.selected_index is None:
+            if self.show_midpoints and self.plot_rect().contains(event.position()):
+                time_s, _ = self.point_data(event.position().x(), event.position().y())
+                comparison = self._cents_at(time_s)
+                if comparison is not None:
+                    center, cents = comparison
+                    center_pos = self.coord(time_s, center)
+                    if abs(center_pos.y() - event.position().y()) <= 8:
+                        direction = "right above left" if cents >= 0 else "left above right"
+                        QToolTip.showText(
+                            self.mapToGlobal(event.position().toPoint()),
+                            f"Center: {center:.1f} Hz\nDifference: {abs(cents):.1f} cents ({direction})",
+                            self,
+                        )
+                        return
+            QToolTip.hideText()
             return super().mouseMoveEvent(event)
         arr = self.points()
         idx = self.selected_index
@@ -490,7 +599,7 @@ class WaveTimeline(QWidget):
 class Editor(QMainWindow):
     def __init__(self, audio: str | None = None):
         super().__init__()
-        self.setWindowTitle("Dichotic Pitch Editor — Praat overlap-add")
+        self.setWindowTitle("Dichotic Pitch Editor")
         self.resize(1250, 950)
         self.engine: PraatEngine | None = None
         self.engines: dict[str, object] = {}
@@ -550,6 +659,7 @@ class Editor(QMainWindow):
         self.interface_tabs=QTabBar()
         self.interface_tabs.addTab("Praat")
         self.interface_tabs.addTab("PitchFlower")
+        self.interface_tabs.addTab("ProMoNet")
         self.interface_tabs.currentChanged.connect(self.switch_interface)
         tabs.addWidget(self.interface_tabs)
         tabs.addStretch()
@@ -573,6 +683,25 @@ class Editor(QMainWindow):
         analysis.addStretch()
         layout.addLayout(analysis)
 
+        visualization = QHBoxLayout()
+        visualization.addWidget(QLabel("Visualization:"))
+        self.midpoint_guides_check = QCheckBox("Show 1:2, 1:1, and 2:1 midpoint guides")
+        self.midpoint_guides_check.setChecked(True)
+        self.midpoint_guides_check.setToolTip(
+            "Solid red is the perceptual 1:1 midpoint. Dotted red lines are the 1:2 and 2:1 blends. "
+            "Hover the solid line to read the left/right separation in cents."
+        )
+        visualization.addWidget(self.midpoint_guides_check)
+        self.mel_axis_check = QCheckBox("Mel pitch axis")
+        self.mel_axis_check.setToolTip("Changes only the vertical display scale and labels; point values remain in Hz.")
+        visualization.addWidget(self.mel_axis_check)
+        visualization.addStretch()
+        layout.addLayout(visualization)
+        self.midpoint_guides_check.toggled.connect(
+            lambda enabled: self.pitch.set_visualization(show_midpoints=enabled))
+        self.mel_axis_check.toggled.connect(
+            lambda enabled: self.pitch.set_visualization(mel_axis=enabled))
+
         self.pitchflower_controls=QHBoxLayout()
         self.pitchflower_controls.addWidget(QLabel("PitchFlower flow steps"))
         self.flow_steps_spin=self._spin(100, 1, 500, 1)
@@ -590,6 +719,30 @@ class Editor(QMainWindow):
         self._set_pitchflower_controls_visible(False)
         for control in (self.flow_steps_spin, self.flow_guidance_spin, self.flow_seed_spin):
             control.valueChanged.connect(self.pitchflower_settings_changed)
+
+        self.promonet_controls=QHBoxLayout()
+        self.promonet_controls.addWidget(QLabel("ProMoNet checkpoint"))
+        self.promonet_checkpoint_mode=QComboBox()
+        self.promonet_checkpoint_mode.addItems(["Default VCTK model", "Custom adapted checkpoint"])
+        self.promonet_controls.addWidget(self.promonet_checkpoint_mode)
+        self.promonet_checkpoint_path=QLabel("Default downloaded on first render")
+        self.promonet_checkpoint_path.setMinimumWidth(260)
+        self.promonet_controls.addWidget(self.promonet_checkpoint_path)
+        self._add_button(self.promonet_controls, "Choose checkpoint…", self.choose_promonet_checkpoint)
+        self.promonet_controls.addWidget(QLabel("Speaker ID"))
+        self.promonet_speaker_spin=self._spin(0, 0, 999, 1)
+        self.promonet_controls.addWidget(self.promonet_speaker_spin)
+        self.promonet_controls.addWidget(QLabel("Spectral balance"))
+        self.promonet_balance_spin=self._spin(1.0, 0.25, 4.0, 0.05, decimals=2)
+        self.promonet_controls.addWidget(self.promonet_balance_spin)
+        self._add_button(self.promonet_controls, "Run ProMoNet", self.run_promonet)
+        self.promonet_controls.addWidget(QLabel("Default model is trained for VCTK voices; use an adapted checkpoint for other voices."))
+        self.promonet_controls.addStretch()
+        layout.addLayout(self.promonet_controls)
+        self._set_promonet_controls_visible(False)
+        for control in (self.promonet_checkpoint_mode, self.promonet_speaker_spin, self.promonet_balance_spin):
+            signal = control.currentIndexChanged if isinstance(control, QComboBox) else control.valueChanged
+            signal.connect(self.promonet_settings_changed)
 
         self.pitch=PitchCanvas()
         self.pitch.on_begin_edit=self._snapshot
@@ -676,7 +829,12 @@ class Editor(QMainWindow):
         playback.addStretch()
         layout.addLayout(playback)
         noise_controls=QHBoxLayout()
-        noise_controls.addWidget(QLabel("White noise level"))
+        noise_controls.addWidget(QLabel("Noise type"))
+        self.noise_type_combo=QComboBox()
+        self.noise_type_combo.addItems(["White noise", "Pink noise", "Stationary speech-shaped noise"])
+        self.noise_type_combo.setToolTip("Choose the spectrum of the optional playback/export noise.")
+        noise_controls.addWidget(self.noise_type_combo)
+        noise_controls.addWidget(QLabel("Noise level"))
         self.noise_slider=QSlider(Qt.Orientation.Horizontal)
         self.noise_slider.setRange(0, 100)
         self.noise_slider.setSingleStep(1)
@@ -684,14 +842,14 @@ class Editor(QMainWindow):
         self.noise_slider.setTickInterval(10)
         self.noise_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.noise_slider.setValue(0)
-        self.noise_slider.setToolTip("Playback white-noise RMS as a percentage of the original recording RMS. Each active ear gets independent noise.")
+        self.noise_slider.setToolTip("Noise RMS as a percentage of the original recording RMS.")
         self.noise_slider.valueChanged.connect(self._update_noise_label)
         noise_controls.addWidget(self.noise_slider, stretch=1)
         self.noise_label=QLabel("Off (0%)")
         self.noise_label.setMinimumWidth(130)
         noise_controls.addWidget(self.noise_label)
         self.noise_export_check=QCheckBox("Include noise in exported WAV")
-        self.noise_export_check.setToolTip("Off by default: white noise is used for auditioning, not permanently mixed into exports.")
+        self.noise_export_check.setToolTip("Off by default: selected noise is used for auditioning, not permanently mixed into exports.")
         noise_controls.addWidget(self.noise_export_check)
         layout.addLayout(noise_controls)
 
@@ -758,6 +916,12 @@ class Editor(QMainWindow):
             if item.widget():
                 item.widget().setVisible(visible)
 
+    def _set_promonet_controls_visible(self, visible: bool):
+        for index in range(self.promonet_controls.count()):
+            item = self.promonet_controls.itemAt(index)
+            if item.widget():
+                item.widget().setVisible(visible)
+
     def _capture_interface_state(self):
         if not self.engine:
             return
@@ -772,6 +936,10 @@ class Editor(QMainWindow):
             "steps": int(self.flow_steps_spin.value()),
             "guidance": float(self.flow_guidance_spin.value()),
             "seed": int(self.flow_seed_spin.value()),
+            "checkpoint_mode": int(self.promonet_checkpoint_mode.currentIndex()),
+            "checkpoint_path": state.get("checkpoint_path", "") if (state := self.interface_states.get(self.interface_name, {})) else "",
+            "speaker": int(self.promonet_speaker_spin.value()),
+            "spectral_balance": float(self.promonet_balance_spin.value()),
         }
 
     def pitchflower_settings_changed(self, _value):
@@ -801,14 +969,76 @@ class Editor(QMainWindow):
         self.start_render()
         self.statusBar().showMessage("Running independent left and right PitchFlower synthesis…")
 
+    def choose_promonet_checkpoint(self):
+        path = QFileDialog.getExistingDirectory(self, "Choose adapted ProMoNet checkpoint directory")
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Choose adapted ProMoNet checkpoint", str(Path.home()),
+                                                   "PyTorch checkpoints (*.pt *.pth);;All files (*)")
+        if not path:
+            return
+        self.promonet_checkpoint_path.setText(path)
+        self.promonet_checkpoint_mode.setCurrentIndex(1)
+        if "promonet" in self.interface_states:
+            self.interface_states["promonet"]["checkpoint_path"] = path
+        self.promonet_settings_changed()
+
+    def promonet_settings_changed(self, _value=None):
+        if self.interface_name != "promonet" or not self.engine:
+            return
+        self.revision += 1
+        self.cache_revision = -1
+        self.cached_stereo = self.raw_stereo = None
+        self.cached_result_f0 = None
+        self.pitch.set_result(None, None)
+        self.timeline.set_generated(None, self.engine.sr)
+        self.interface_states["promonet"]["result"] = None
+        self.statusBar().showMessage("ProMoNet settings changed; click Run ProMoNet to generate new audio.")
+
+    def run_promonet(self):
+        if self.interface_name != "promonet" or not self.engine:
+            return
+        if self.promonet_checkpoint_mode.currentIndex() and not self.interface_states["promonet"].get("checkpoint_path"):
+            QMessageBox.warning(self, "Choose a checkpoint", "Select an adapted ProMoNet checkpoint file or directory first.")
+            return
+        self.promonet_settings_changed()
+        self.timer.stop()
+        self.start_render()
+        self.statusBar().showMessage("Running independent left and right ProMoNet synthesis…")
+
+    def _initialize_promonet(self) -> bool:
+        """Create the costly optional adapter only when its tab is selected."""
+        if "promonet" in self.engines:
+            return True
+        try:
+            source = self.engines["praat"].path
+            engine = ProMoNetEngine(source, float(self.floor_spin.value()), float(self.ceiling_spin.value()))
+            self.engines["promonet"] = engine
+            breaks = infer_segment_breaks(engine.initial_pitch)
+            self.interface_states["promonet"] = {
+                "left": engine.initial_pitch.copy(), "right": engine.initial_pitch.copy(),
+                "left_breaks": breaks, "right_breaks": breaks, "result": None, "audio": None,
+                "raw_audio": None, "point_spacing_ms": 20.0, "checkpoint_mode": 0,
+                "checkpoint_path": "", "speaker": 0, "spectral_balance": 1.0,
+            }
+            return True
+        except Exception as exc:
+            self.interface_errors["promonet"] = str(exc)
+            QMessageBox.warning(self, "ProMoNet unavailable", str(exc))
+            return False
+
     def switch_interface(self, index: int):
-        name = "praat" if index == 0 else "pitchflower"
+        name = INTERFACES[index]
         if name == self.interface_name or not self.engines:
             return
-        if name not in self.engines:
-            QMessageBox.warning(self, "PitchFlower unavailable", self.interface_errors.get(name, "PitchFlower is unavailable."))
+        if name == "promonet" and not self._initialize_promonet():
             self.interface_tabs.blockSignals(True)
-            self.interface_tabs.setCurrentIndex(0)
+            self.interface_tabs.setCurrentIndex(INTERFACES.index(self.interface_name))
+            self.interface_tabs.blockSignals(False)
+            return
+        if name not in self.engines:
+            QMessageBox.warning(self, f"{name.title()} unavailable", self.interface_errors.get(name, f"{name.title()} is unavailable."))
+            self.interface_tabs.blockSignals(True)
+            self.interface_tabs.setCurrentIndex(INTERFACES.index(self.interface_name))
             self.interface_tabs.blockSignals(False)
             return
         self._capture_interface_state()
@@ -823,10 +1053,22 @@ class Editor(QMainWindow):
         result = state.get("result")
         self.cached_result_f0 = result
         self.pitch.set_result(*(result if result else (None, None)))
+        controls = (self.spacing_spin, self.flow_steps_spin, self.flow_guidance_spin,
+                    self.flow_seed_spin, self.promonet_checkpoint_mode,
+                    self.promonet_speaker_spin, self.promonet_balance_spin)
+        for control in controls:
+            control.blockSignals(True)
         self.spacing_spin.setValue(state.get("point_spacing_ms", 20))
         self.flow_steps_spin.setValue(state.get("steps", 100))
         self.flow_guidance_spin.setValue(state.get("guidance", 2.0))
         self.flow_seed_spin.setValue(state.get("seed", 0))
+        self.promonet_checkpoint_mode.setCurrentIndex(state.get("checkpoint_mode", 0))
+        checkpoint_path = state.get("checkpoint_path", "")
+        self.promonet_checkpoint_path.setText(checkpoint_path or "Default downloaded on first render")
+        self.promonet_speaker_spin.setValue(state.get("speaker", 0))
+        self.promonet_balance_spin.setValue(state.get("spectral_balance", 1.0))
+        for control in controls:
+            control.blockSignals(False)
         self.raw_stereo = state.get("raw_audio")
         self.cached_stereo = state.get("audio")
         self.cache_revision = -1
@@ -836,6 +1078,7 @@ class Editor(QMainWindow):
         self.timeline.set_audio(self.engine.samples, self.engine.sr, state.get("audio"))
         self.filename.setText(f"{Path(self.engine.path).name}  |  {self.engine.duration:.2f}s  |  {name.title()}")
         self._set_pitchflower_controls_visible(name == "pitchflower")
+        self._set_promonet_controls_visible(name == "promonet")
         self.statusBar().showMessage(f"Switched to {name.title()}; its F0 curves are independent from the other interface.")
 
     def choose_audio(self):
@@ -910,6 +1153,7 @@ class Editor(QMainWindow):
             self.interface_tabs.setCurrentIndex(0)
             self.interface_tabs.blockSignals(False)
             self._set_pitchflower_controls_visible(False)
+            self._set_promonet_controls_visible(False)
             if len(new_engine.initial_pitch)==0:
                 QMessageBox.warning(self,"No detected F0","Praat found no voiced pitch points. "
                     "Try changing the pitch analysis range. Adding points alone cannot make unvoiced audio voiced.")
@@ -1114,6 +1358,14 @@ class Editor(QMainWindow):
                 steps=int(self.flow_steps_spin.value()), guidance=float(self.flow_guidance_spin.value()),
                 seed=int(self.flow_seed_spin.value()),
             )
+        elif self.interface_name == "promonet":
+            state = self.interface_states["promonet"]
+            checkpoint = state.get("checkpoint_path", "") if self.promonet_checkpoint_mode.currentIndex() else None
+            future = self.executor.submit(
+                engine.stereo, left, right, checkpoint=checkpoint,
+                speaker=int(self.promonet_speaker_spin.value()),
+                spectral_balance=float(self.promonet_balance_spin.value()),
+            )
         else:
             future=self.executor.submit(engine.stereo,left,right)
         def done(future):
@@ -1158,7 +1410,7 @@ class Editor(QMainWindow):
             # Last edit wins. Don't play stale stereo after a new drag.
             self.start_render()
             return
-        if isinstance(audio, PitchFlowerResult):
+        if isinstance(audio, (PitchFlowerResult, ProMoNetResult)):
             self.raw_stereo=audio.stereo
             self.cached_result_f0=(audio.left_result_f0, audio.right_result_f0)
             self.pitch.set_result(*self.cached_result_f0)
@@ -1221,7 +1473,10 @@ class Editor(QMainWindow):
                       (False, True) if request.mode == "right" else (True, True))
             reference_rms = float(np.sqrt(np.mean(self.engine.samples ** 2)))
             stereo = mix_white_noise(stereo, self.noise_slider.value(), reference_rms,
-                                     active_channels=active, start_sample=a)
+                                     active_channels=active, start_sample=a,
+                                     linked_channels=(request.mode == "stereo"),
+                                     noise_type=self.noise_type_combo.currentText(),
+                                     sample_rate=sr)
         # sd.play is nonblocking. Praat synthesis never runs in the audio callback.
         try:
             sd.stop()
@@ -1259,7 +1514,9 @@ class Editor(QMainWindow):
             audio = self.cached_stereo
             if self.noise_export_check.isChecked() and self.noise_slider.value():
                 reference_rms = float(np.sqrt(np.mean(self.engine.samples ** 2)))
-                audio = mix_white_noise(audio, self.noise_slider.value(), reference_rms)
+                audio = mix_white_noise(audio, self.noise_slider.value(), reference_rms,
+                                        noise_type=self.noise_type_combo.currentText(),
+                                        sample_rate=self.engine.sr)
             sf.write(file, audio, self.engine.sr, subtype="PCM_24")
             suffix = " (with white noise)" if self.noise_export_check.isChecked() and self.noise_slider.value() else " (clean)"
             self.statusBar().showMessage(f"Exported stereo WAV{suffix}: {file}")
@@ -1300,7 +1557,10 @@ class Editor(QMainWindow):
                     "point_spacing_ms":state.get("point_spacing_ms",20.0),
                     "settings":({"pitch_floor_hz":engine.floor,"pitch_ceiling_hz":engine.ceiling}
                                  if name=="praat" else
-                                 {"flow_steps":state.get("steps",100),"guidance":state.get("guidance",2.0),"seed":state.get("seed",0)}),
+                                 {"flow_steps":state.get("steps",100),"guidance":state.get("guidance",2.0),"seed":state.get("seed",0)}
+                                 if name=="pitchflower" else
+                                 {"checkpoint_mode":state.get("checkpoint_mode",0), "checkpoint_path":state.get("checkpoint_path", ""),
+                                  "speaker":state.get("speaker",0), "spectral_balance":state.get("spectral_balance",1.0)}),
                     "result":None if result is None else {
                         "left_measured_f0":result[0].tolist(), "right_measured_f0":result[1].tolist(),
                     },
@@ -1309,10 +1569,13 @@ class Editor(QMainWindow):
                 self.engine.path, file,
                 shared={"active_interface":self.interface_name, "active_contour":self.pitch.active,
                         "white_noise_percent":int(self.noise_slider.value()),
+                        "noise_type":self.noise_type_combo.currentText(),
                         "white_noise_in_export":bool(self.noise_export_check.isChecked()),
                         "match_output_rms":bool(self.level_match_check.isChecked()),
                         "output_gain_db":float(self.output_gain_spin.value()),
                         "peak_ceiling_dbfs":float(self.peak_ceiling_spin.value()),
+                        "show_midpoint_guides":bool(self.midpoint_guides_check.isChecked()),
+                        "mel_pitch_axis":bool(self.mel_axis_check.isChecked()),
                         "selection":self.timeline.selection},
                 engines=interfaces,
             )
@@ -1334,6 +1597,10 @@ class Editor(QMainWindow):
             settings=praat_data.get("settings",praat_data)
             self.open_audio(path,settings.get("pitch_floor_hz",75),settings.get("pitch_ceiling_hz",600))
             if self.engine is None:return
+            # A saved ProMoNet payload is loaded before applying its points so
+            # the adapter can provide its own time grid and source contour.
+            if data.get("interfaces", {}).get("promonet") and not self._initialize_promonet():
+                self.statusBar().showMessage("Project loaded without ProMoNet: install its optional extra to restore that tab.")
             for name, payload in data.get("interfaces",{}).items():
                 if not payload or name not in self.engines:
                     continue
@@ -1353,13 +1620,22 @@ class Editor(QMainWindow):
                     "result":result,"point_spacing_ms":float(payload.get("point_spacing_ms",20)),
                     "steps":int(ps.get("flow_steps",100)),"guidance":float(ps.get("guidance",2.0)),
                     "seed":int(ps.get("seed",0)),
+                    "checkpoint_mode":int(ps.get("checkpoint_mode", 0)),
+                    "checkpoint_path":str(ps.get("checkpoint_path", "")),
+                    "speaker":int(ps.get("speaker", 0)),
+                    "spectral_balance":float(ps.get("spectral_balance", 1.0)),
                 })
             shared=data.get("shared",{})
             self.noise_slider.setValue(int(shared.get("white_noise_percent", 0)))
+            noise_type = str(shared.get("noise_type", "White noise"))
+            noise_index = self.noise_type_combo.findText(noise_type)
+            self.noise_type_combo.setCurrentIndex(max(0, noise_index))
             self.noise_export_check.setChecked(bool(shared.get("white_noise_in_export", False)))
             self.level_match_check.setChecked(bool(shared.get("match_output_rms", True)))
             self.output_gain_spin.setValue(float(shared.get("output_gain_db", 0.0)))
             self.peak_ceiling_spin.setValue(float(shared.get("peak_ceiling_dbfs", -1.0)))
+            self.midpoint_guides_check.setChecked(bool(shared.get("show_midpoint_guides", True)))
+            self.mel_axis_check.setChecked(bool(shared.get("mel_pitch_axis", False)))
             selection=shared.get("selection")
             if selection:
                 a,b=map(float,selection)
@@ -1367,7 +1643,7 @@ class Editor(QMainWindow):
                     self.timeline.selection=(a,b)
                     self.use_selection.setChecked(True)
             active=shared.get("active_interface","praat")
-            self.interface_tabs.setCurrentIndex(0 if active=="praat" else 1)
+            self.interface_tabs.setCurrentIndex(INTERFACES.index(active) if active in INTERFACES and active in self.engines else 0)
             if active=="praat":
                 state=self.interface_states["praat"]
                 self.pitch.set_points(LEFT,state["left"],state["left_breaks"])

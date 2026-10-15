@@ -20,6 +20,11 @@ pitchflower = [
     # setuptools 82. Keep the neural extra compatible until pyworld updates.
     "setuptools<81",
 ]
+promonet = [
+    "promonet",
+    "pyworld>=0.3.5",
+    "setuptools<81",
+]
 
 [project.scripts]
 dichotic-praat-editor = "dichotic_editor:main"
@@ -37,6 +42,9 @@ include = ["dichotic*"]
 
 [tool.uv.sources]
 pitchflower = { path = "external/PitchFlower", editable = true }
+promonet = { git = "https://github.com/maxrmorrison/promonet", rev = "86b815e8511d526da42cd8333a9f5a2872b11981" }
+penn = { git = "https://github.com/interactiveaudiolab/penn", branch = "dev" }
+torbi = { git = "https://github.com/maxrmorrison/torbi" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

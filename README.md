@@ -4,8 +4,11 @@ The editor has independent synthesis-interface tabs:
 
 - **Praat** uses native overlap-add resynthesis with independent left/right PitchTier curves.
 - **PitchFlower** uses two independent neural renders. Its editable curves, flow steps, guidance, seed, generated result F0 overlays, and audio cache are separate from Praat's data.
+- **ProMoNet** uses independently conditioned neural renders at 22.05 kHz. Its points, checkpoint selection, speaker ID, spectral-balance setting, generated F0 overlays, and audio cache are separate from the other tabs.
 
 Both tabs share the timeline, dichotic playback modes, exports, undoable contour editing, and one versioned project file. Generated PitchFlower F0 is shown as a dashed result overlay and never overwrites either editable curve. PitchFlower works at 24 kHz and reports an error when resampled source audio exceeds its supported duration.
+
+The contour view can show three red perceptual midpoint guides between the left and right editable curves: solid red is the 1:1 center, while dotted red curves are the 1:2 and 2:1 blends. Hover the solid red guide to see the channel separation in cents. Use **Mel pitch axis** to switch only the vertical display scale; editable F0 values and synthesis remain in Hz.
 
 The pitch floor and ceiling fields apply to whichever interface is reanalyzed, including PitchFlower's WORLD contour. After rendering, the waveform timeline shows the generated left/right RMS envelopes and reports their RMS and dBFS values. **Match generated channel RMS to source** equalizes the two interface outputs toward the source level, **Output gain** applies a final gain, and **Peak ceiling** applies a shared limiter to reduce high-level ringing and clipping. These controls change level only; they do not change F0 contours. Echo-like temporal artifacts originate in the resynthesis model and may require changing the F0 edit, Praat analysis range, or PitchFlower flow settings rather than gain matching alone.
 
@@ -14,6 +17,14 @@ Install the optional neural stack before selecting its tab:
 ```bash
 uv sync --extra pitchflower
 ```
+
+Install ProMoNet separately when needed:
+
+```bash
+uv sync --extra promonet
+```
+
+The **ProMoNet** tab initializes its feature analysis when first selected. Its default checkpoint downloads on the first render and is trained for VCTK voices. Select **Custom adapted checkpoint** and choose the generated checkpoint file or directory, then enter its speaker ID, when using a separately adapted voice. ProMoNet preserves unvoiced frames and clips edited voiced F0 values to its supported 50–550 Hz range.
 
 Existing `dichotic-praat-editor-v1` project files are migrated on load. New saves use `dichotic-editor-v2` and retain isolated state for each available interface.
 
@@ -106,9 +117,9 @@ To listen to a time range, **drag across the waveform** (above the ruler). This 
 
 Keyboard alternatives: **Space** stereo, **L** left, **R** right, **O** unmodified original, **S** swapped, **Esc** stop, **Ctrl+Z** undo, **Ctrl+Y** redo, **Delete** remove selected point. The buttons perform the same actions without a shortcut.
 
-### White-noise masking during playback
+### Noise masking during playback
 
-The **White noise level** bar is immediately below the playback buttons:
+The **Noise type** dropdown and noise-level bar are immediately below the playback buttons. Choose White noise, Pink noise, or Stationary speech-shaped noise:
 
 | Setting | Result |
 | --- | --- |
@@ -117,7 +128,7 @@ The **White noise level** bar is immediately below the playback buttons:
 | **50%** | Noise RMS = 50% of the original recording RMS (about −6 dB) |
 | **100%** | Noise RMS = original recording RMS (0 dB relative) |
 
-Both channels receive **independent, uncorrelated** white noise. For Left-only or Right-only playback, the inactive ear stays silent. Original/Swapped/Stereo playback get noise in both ears. The same segment uses the same random seed each replay for repeatable comparisons. At high levels, the program may attenuate both channels together to prevent clipping.
+Pink noise has a 1/f spectrum. Stationary speech-shaped noise uses a fixed long-term-average speech spectrum. Stereo playback uses the same selected noise waveform in both ears; Left-only, Right-only, and Swapped playback keep independent channel noise. For Left-only or Right-only playback, the inactive ear stays silent. The same segment uses the same random seed each replay for repeatable comparisons. At high levels, the program may attenuate both channels together to prevent clipping.
 
 Moving the noise slider changes the **next playback immediately** (no new Praat resynthesis). Noise is **not** automatically saved into your stereo WAV: check **Include noise in exported WAV** to bake the currently selected level into the export.
 
@@ -148,7 +159,7 @@ The CLI also supports `--project saved.json` to use contours saved by the GUI, f
 Run audio-engine tests:
 
 ```bash
-uv run --python 3.12 --with pytest pytest -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run --python 3.12 --with pytest pytest -q
 ```
 
 Tests use synthetic harmonic recordings and do **not** need headphones or an active audio device. `tests/demo_vowel.wav` and `tests/demo_stereo.wav` demonstrate input and two-channel output.

@@ -126,6 +126,23 @@ def test_noise_only_in_audible_channel_and_peak_guard():
         mix_white_noise(silent, 101, .1)
 
 
+def test_stereo_noise_can_be_shared_between_ears():
+    silent = np.zeros((2000, 2), dtype=np.float32)
+    linked = mix_white_noise(silent, 50, .1, linked_channels=True)
+    np.testing.assert_array_equal(linked[:, 0], linked[:, 1])
+    independent = mix_white_noise(silent, 50, .1)
+    assert not np.array_equal(independent[:, 0], independent[:, 1])
+
+
+def test_noise_types_are_deterministic_and_rms_matched():
+    silent = np.zeros((4096, 2), dtype=np.float32)
+    for noise_type in ("White noise", "Pink noise", "Stationary speech-shaped noise"):
+        first = mix_white_noise(silent, 50, .1, noise_type=noise_type, sample_rate=24000)
+        second = mix_white_noise(silent, 50, .1, noise_type=noise_type, sample_rate=24000)
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_allclose(np.sqrt(np.mean(first ** 2, axis=0)), .05, atol=1e-4)
+
+
 def test_resampled_edited_contours_work_with_native_praat(tmp_path):
     import soundfile as sf
     from praat_backend import PraatEngine
