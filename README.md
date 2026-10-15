@@ -5,8 +5,9 @@ The editor has independent synthesis-interface tabs:
 - **Praat** uses native overlap-add resynthesis with independent left/right PitchTier curves.
 - **PitchFlower** uses two independent neural renders. Its editable curves, flow steps, guidance, seed, generated result F0 overlays, and audio cache are separate from Praat's data.
 - **ProMoNet** uses independently conditioned neural renders at 22.05 kHz. Its points, checkpoint selection, speaker ID, spectral-balance setting, generated F0 overlays, and audio cache are separate from the other tabs.
+- **WORLD Vocoder** analyzes the source once at 24 kHz, keeps one shared harmonic spectral envelope (`sp`) and aperiodicity envelope (`ap`) for both channels, and changes only the left/right F0 contours drawn in the editor.
 
-Both tabs share the timeline, dichotic playback modes, exports, undoable contour editing, and one versioned project file. Generated PitchFlower F0 is shown as a dashed result overlay and never overwrites either editable curve. PitchFlower works at 24 kHz and reports an error when resampled source audio exceeds its supported duration.
+All interface tabs share the timeline, dichotic playback modes, exports, undoable contour editing, and one versioned project file. Generated PitchFlower F0 is shown as a dashed result overlay and never overwrites either editable curve. PitchFlower works at 24 kHz and reports an error when resampled source audio exceeds its supported duration.
 
 The contour view can show three red perceptual midpoint guides between the left and right editable curves: solid red is the 1:1 center, while dotted red curves are the 1:2 and 2:1 blends. Hover the solid red guide to see the channel separation in cents. Use **Mel pitch axis** to switch only the vertical display scale; editable F0 values and synthesis remain in Hz.
 
@@ -23,6 +24,14 @@ Install ProMoNet separately when needed:
 ```bash
 uv sync --extra promonet
 ```
+
+Install the optional WORLD Vocoder interface separately when needed:
+
+```bash
+uv sync --extra world
+```
+
+WORLD recordings are downmixed to mono and resampled to 24 kHz for a consistent analysis grid. The source voicing mask is preserved, so drawing points in an unvoiced gap does not create voiced audio. Both channels receive the exact same `sp` and `ap` arrays; only their edited F0 arrays differ.
 
 The **ProMoNet** tab initializes its feature analysis when first selected. Its default checkpoint downloads on the first render and is trained for VCTK voices. Select **Custom adapted checkpoint** and choose the generated checkpoint file or directory, then enter its speaker ID, when using a separately adapted voice. ProMoNet preserves unvoiced frames and clips edited voiced F0 values to its supported 50–550 Hz range.
 
@@ -141,7 +150,18 @@ Moving the noise slider changes the **next playback immediately** (no new Praat 
 - **Save project…** saves a JSON file with both independent F0 tiers, voiced-region boundary indices, point-spacing field, current noise level, export-noise preference, and a path to the original audio. Keep the source recording available when reopening; the audio is **not embedded** into the JSON. Existing v1 projects continue to load.
 - **Load project…** restores both edits (also supported as a `.json` command-line argument).
 - **Export stereo WAV…** exports left orange and right blue as 24-bit stereo PCM. Export is **clean by default**, and includes noise only when the corresponding checkbox is enabled.
+- **Export audio ZIP…** packages `left_mono.wav`, `right_mono.wav`, `original.wav`, and `dichotic.wav` using the current generated output and export-noise setting.
 - **Export F0 CSV…** saves `channel,time_s,f0_hz` for both curves, for data analysis or plotting.
+
+### Coherent amplitude modulation
+
+Enable **Add coherent amplitude modulation** to apply the same gain function to both generated channels:
+
+```text
+a(t) = 1 + depth × sin(2π × rate × t)
+```
+
+The rate can be selected from 2–10 Hz and the depth from 0–100% (20% depth and 4 Hz are provided as exploratory defaults). Modulation is applied after F0 synthesis and output level matching, and the peak ceiling remains active. The original audio is not modulated.
 
 Stereo input files are downmixed to mono before pitch analysis: both edited channels are derived from **the same signal**. Headphones and a stereo output device are needed. Check that your OS audio accessibility settings are not mixing both ears into mono.
 

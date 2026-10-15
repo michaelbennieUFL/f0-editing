@@ -43,3 +43,15 @@ def test_project_can_store_independent_promonet_settings(tmp_path):
     settings = project["interfaces"]["promonet"]["settings"]
     assert settings["checkpoint_path"] == "adapted"
     assert settings["speaker"] == 3
+
+
+def test_project_can_store_world_interface_state(tmp_path):
+    project = new_project(
+        str(tmp_path / "input.wav"), str(tmp_path / "edit.json"),
+        shared={"active_interface": "world"},
+        engines={"world": {
+            "left_pitch_points": [[0, 200]], "right_pitch_points": [[0, 220]],
+            "settings": {"pitch_floor_hz": 60, "pitch_ceiling_hz": 700},
+        }},
+    )
+    assert project["interfaces"]["world"]["settings"]["pitch_ceiling_hz"] == 700

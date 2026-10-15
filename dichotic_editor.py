@@ -9,11 +9,13 @@ when a drag ends, and Play waits for the latest rendered sound if necessary.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import math
 import os
 import sys
 import traceback
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,12 +49,14 @@ from praat_backend import (
     PraatEngine, checked_points, infer_segment_breaks, normalize_breaks,
     resample_editable_pitch, insert_editable_point, delete_editable_point,
     simplify_segmented_pitch, mix_white_noise, normalize_stereo_levels,
+    apply_shared_amplitude_modulation,
 )
 from dichotic.project import PROJECT_FORMAT, migrate_legacy, new_project, resolve_audio_path
 from dichotic.interfaces.pitchflower import PitchFlowerEngine, PitchFlowerResult
 from dichotic.interfaces.promonet import ProMoNetEngine, ProMoNetResult
+from dichotic.interfaces.world import WorldEngine
 
-INTERFACES = ("praat", "pitchflower", "promonet")
+INTERFACES = ("praat", "pitchflower", "promonet", "world")
 
 
 @dataclass
@@ -621,6 +625,7 @@ class Editor(QMainWindow):
         self.render_inflight=False
         self.pending_play: PlaybackRequest | None=None
         self.pending_export: str | None=None
+        self.pending_zip_export: str | None=None
         self.cached_result_f0: tuple[np.ndarray, np.ndarray] | None = None
         self.undo_stack: list[tuple[np.ndarray, np.ndarray, tuple[int, ...], tuple[int, ...]]] = []
         self.redo_stack: list[tuple[np.ndarray, np.ndarray, tuple[int, ...], tuple[int, ...]]] = []
@@ -647,6 +652,7 @@ class Editor(QMainWindow):
         btn("Save project…", self.save_project)
         btn("Load project…",self.load_project)
         btn("Export stereo WAV…",self.export_stereo)
+        btn("Export audio ZIP…",self.export_audio_zip)
         btn("Export F0 CSV…",self.export_csv)
         bar.addStretch()
         self.filename=QLabel("No recording loaded")
@@ -660,6 +666,7 @@ class Editor(QMainWindow):
         self.interface_tabs.addTab("Praat")
         self.interface_tabs.addTab("PitchFlower")
         self.interface_tabs.addTab("ProMoNet")
+        self.interface_tabs.addTab("WORLD Vocoder")
         self.interface_tabs.currentChanged.connect(self.switch_interface)
         tabs.addWidget(self.interface_tabs)
         tabs.addStretch()
@@ -853,6 +860,22 @@ class Editor(QMainWindow):
         noise_controls.addWidget(self.noise_export_check)
         layout.addLayout(noise_controls)
 
+        modulation_controls=QHBoxLayout()
+        self.am_check=QCheckBox("Add coherent amplitude modulation")
+        self.am_check.setToolTip("Apply the same sinusoidal gain envelope to both generated channels.")
+        modulation_controls.addWidget(self.am_check)
+        modulation_controls.addWidget(QLabel("Rate"))
+        self.am_rate_spin=self._spin(4.0,2.0,10.0,0.5,decimals=1)
+        self.am_rate_spin.setSuffix(" Hz")
+        modulation_controls.addWidget(self.am_rate_spin)
+        modulation_controls.addWidget(QLabel("Depth"))
+        self.am_depth_spin=self._spin(20.0,0.0,100.0,5.0,decimals=1)
+        self.am_depth_spin.setSuffix(" %")
+        modulation_controls.addWidget(self.am_depth_spin)
+        modulation_controls.addWidget(QLabel("Shared across left and right generated audio"))
+        modulation_controls.addStretch()
+        layout.addLayout(modulation_controls)
+
         level_controls=QHBoxLayout()
         self.level_match_check=QCheckBox("Match generated channel RMS to source")
         self.level_match_check.setChecked(True)
@@ -871,6 +894,9 @@ class Editor(QMainWindow):
         self.level_match_check.toggled.connect(self._output_levels_changed)
         self.output_gain_spin.valueChanged.connect(self._output_levels_changed)
         self.peak_ceiling_spin.valueChanged.connect(self._output_levels_changed)
+        self.am_check.toggled.connect(self._output_levels_changed)
+        self.am_rate_spin.valueChanged.connect(self._output_levels_changed)
+        self.am_depth_spin.valueChanged.connect(self._output_levels_changed)
 
         hint=QLabel("Orange ▼ = LEFT F0    •    Blue ▲ = RIGHT F0    •    Gray dashed = untouched original reference. "
                     "Double-click to add to active track; Shift+double-click adds LEFT and Ctrl+double-click adds RIGHT. "
@@ -1026,11 +1052,36 @@ class Editor(QMainWindow):
             QMessageBox.warning(self, "ProMoNet unavailable", str(exc))
             return False
 
+    def _initialize_world(self) -> bool:
+        """Create the optional WORLD adapter only when its tab is selected."""
+        if "world" in self.engines:
+            return True
+        try:
+            source = self.engines["praat"].path
+            engine = WorldEngine(source, float(self.floor_spin.value()), float(self.ceiling_spin.value()))
+            self.engines["world"] = engine
+            breaks = infer_segment_breaks(engine.initial_pitch)
+            self.interface_states["world"] = {
+                "left": engine.initial_pitch.copy(), "right": engine.initial_pitch.copy(),
+                "left_breaks": breaks, "right_breaks": breaks, "result": None, "audio": None,
+                "raw_audio": None, "point_spacing_ms": 20.0,
+            }
+            return True
+        except Exception as exc:
+            self.interface_errors["world"] = str(exc)
+            QMessageBox.warning(self, "WORLD unavailable", str(exc))
+            return False
+
     def switch_interface(self, index: int):
         name = INTERFACES[index]
         if name == self.interface_name or not self.engines:
             return
         if name == "promonet" and not self._initialize_promonet():
+            self.interface_tabs.blockSignals(True)
+            self.interface_tabs.setCurrentIndex(INTERFACES.index(self.interface_name))
+            self.interface_tabs.blockSignals(False)
+            return
+        if name == "world" and not self._initialize_world():
             self.interface_tabs.blockSignals(True)
             self.interface_tabs.setCurrentIndex(INTERFACES.index(self.interface_name))
             self.interface_tabs.blockSignals(False)
@@ -1132,6 +1183,7 @@ class Editor(QMainWindow):
             self.render_inflight=False  # stale jobs are ignored by session ID
             self.pending_play=None
             self.pending_export=None
+            self.pending_zip_export=None
             self.undo_stack.clear()
             self.redo_stack.clear()
             self.pitch.set_data(new_engine.initial_pitch,new_engine.duration,floor,ceiling)
@@ -1366,6 +1418,8 @@ class Editor(QMainWindow):
                 speaker=int(self.promonet_speaker_spin.value()),
                 spectral_balance=float(self.promonet_balance_spin.value()),
             )
+        elif self.interface_name == "world":
+            future=self.executor.submit(engine.stereo, left, right)
         else:
             future=self.executor.submit(engine.stereo,left,right)
         def done(future):
@@ -1393,6 +1447,16 @@ class Editor(QMainWindow):
             gain_db=float(self.output_gain_spin.value()),
             peak_dbfs=float(self.peak_ceiling_spin.value()),
         )
+        if self.am_check.isChecked():
+            self.cached_stereo = apply_shared_amplitude_modulation(
+                self.cached_stereo, self.engine.sr,
+                float(self.am_rate_spin.value()), float(self.am_depth_spin.value()),
+            )
+            # The modulation gain can raise peaks above the configured ceiling.
+            self.cached_stereo = normalize_stereo_levels(
+                self.cached_stereo, self.engine.samples, match_rms=False,
+                peak_dbfs=float(self.peak_ceiling_spin.value()),
+            )
         if self.interface_name in self.interface_states:
             self.interface_states[self.interface_name]["audio"] = self.cached_stereo
             self.interface_states[self.interface_name]["raw_audio"] = self.raw_stereo
@@ -1404,6 +1468,7 @@ class Editor(QMainWindow):
         if error:
             self.pending_play=None
             self.pending_export=None
+            self.pending_zip_export=None
             QMessageBox.critical(self, f"{self.interface_name.title()} resynthesis failed", str(error))
             return
         if revision!=self.revision:
@@ -1427,6 +1492,10 @@ class Editor(QMainWindow):
             filename=self.pending_export
             self.pending_export=None
             self._write_wav(filename)
+        if self.pending_zip_export:
+            filename=self.pending_zip_export
+            self.pending_zip_export=None
+            self._write_audio_zip(filename)
         if self.pending_play:
             request=self.pending_play
             self.pending_play=None
@@ -1508,6 +1577,18 @@ class Editor(QMainWindow):
             self.pending_export=None
             self._write_wav(file)
 
+    def export_audio_zip(self):
+        if not self.engine:return
+        suggested=Path(self.engine.path).with_name(Path(self.engine.path).stem+"_dichotic_audio.zip")
+        file,_=QFileDialog.getSaveFileName(self,"Export audio ZIP",str(suggested),"ZIP archive (*.zip)")
+        if not file:return
+        self.pending_zip_export=file
+        if self.cached_stereo is None or self.cache_revision!=self.revision:
+            self.start_render()
+        else:
+            self.pending_zip_export=None
+            self._write_audio_zip(file)
+
     def _write_wav(self,file:str):
         try:
             assert self.engine is not None and self.cached_stereo is not None
@@ -1521,6 +1602,32 @@ class Editor(QMainWindow):
             suffix = " (with white noise)" if self.noise_export_check.isChecked() and self.noise_slider.value() else " (clean)"
             self.statusBar().showMessage(f"Exported stereo WAV{suffix}: {file}")
         except Exception as exc:self._error("Could not write WAV",exc)
+
+    def _write_audio_zip(self,file:str):
+        try:
+            assert self.engine is not None and self.cached_stereo is not None
+            audio = self.cached_stereo
+            if self.noise_export_check.isChecked() and self.noise_slider.value():
+                reference_rms = float(np.sqrt(np.mean(self.engine.samples ** 2)))
+                audio = mix_white_noise(audio, self.noise_slider.value(), reference_rms,
+                                        noise_type=self.noise_type_combo.currentText(),
+                                        sample_rate=self.engine.sr)
+            left = np.asarray(audio[:, 0], dtype=np.float32)
+            right = np.asarray(audio[:, 1], dtype=np.float32)
+            original = np.asarray(self.engine.samples, dtype=np.float32)
+            files = {
+                "left_mono.wav": (left, self.engine.sr),
+                "right_mono.wav": (right, self.engine.sr),
+                "original.wav": (original, self.engine.sr),
+                "dichotic.wav": (audio, self.engine.sr),
+            }
+            with zipfile.ZipFile(file, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for name, (samples, sample_rate) in files.items():
+                    buffer = io.BytesIO()
+                    sf.write(buffer, samples, sample_rate, format="WAV", subtype="PCM_24")
+                    archive.writestr(name, buffer.getvalue())
+            self.statusBar().showMessage(f"Exported audio ZIP: {file}")
+        except Exception as exc:self._error("Could not write audio ZIP",exc)
 
     def export_csv(self):
         if not self.engine:return
@@ -1556,7 +1663,7 @@ class Editor(QMainWindow):
                     "right_segment_starts":list(state["right_breaks"]),
                     "point_spacing_ms":state.get("point_spacing_ms",20.0),
                     "settings":({"pitch_floor_hz":engine.floor,"pitch_ceiling_hz":engine.ceiling}
-                                 if name=="praat" else
+                                 if name in ("praat", "world") else
                                  {"flow_steps":state.get("steps",100),"guidance":state.get("guidance",2.0),"seed":state.get("seed",0)}
                                  if name=="pitchflower" else
                                  {"checkpoint_mode":state.get("checkpoint_mode",0), "checkpoint_path":state.get("checkpoint_path", ""),
@@ -1574,6 +1681,9 @@ class Editor(QMainWindow):
                         "match_output_rms":bool(self.level_match_check.isChecked()),
                         "output_gain_db":float(self.output_gain_spin.value()),
                         "peak_ceiling_dbfs":float(self.peak_ceiling_spin.value()),
+                        "am_enabled":bool(self.am_check.isChecked()),
+                        "am_rate_hz":float(self.am_rate_spin.value()),
+                        "am_depth_percent":float(self.am_depth_spin.value()),
                         "show_midpoint_guides":bool(self.midpoint_guides_check.isChecked()),
                         "mel_pitch_axis":bool(self.mel_axis_check.isChecked()),
                         "selection":self.timeline.selection},
@@ -1601,6 +1711,8 @@ class Editor(QMainWindow):
             # the adapter can provide its own time grid and source contour.
             if data.get("interfaces", {}).get("promonet") and not self._initialize_promonet():
                 self.statusBar().showMessage("Project loaded without ProMoNet: install its optional extra to restore that tab.")
+            if data.get("interfaces", {}).get("world") and not self._initialize_world():
+                self.statusBar().showMessage("Project loaded without WORLD: install its optional extra to restore that tab.")
             for name, payload in data.get("interfaces",{}).items():
                 if not payload or name not in self.engines:
                     continue
@@ -1634,6 +1746,9 @@ class Editor(QMainWindow):
             self.level_match_check.setChecked(bool(shared.get("match_output_rms", True)))
             self.output_gain_spin.setValue(float(shared.get("output_gain_db", 0.0)))
             self.peak_ceiling_spin.setValue(float(shared.get("peak_ceiling_dbfs", -1.0)))
+            self.am_check.setChecked(bool(shared.get("am_enabled", False)))
+            self.am_rate_spin.setValue(float(shared.get("am_rate_hz", 4.0)))
+            self.am_depth_spin.setValue(float(shared.get("am_depth_percent", 20.0)))
             self.midpoint_guides_check.setChecked(bool(shared.get("show_midpoint_guides", True)))
             self.mel_axis_check.setChecked(bool(shared.get("mel_pitch_axis", False)))
             selection=shared.get("selection")

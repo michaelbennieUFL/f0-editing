@@ -1,6 +1,7 @@
 import numpy as np
+import pytest
 
-from praat_backend import normalize_stereo_levels
+from praat_backend import apply_shared_amplitude_modulation, normalize_stereo_levels
 
 
 def test_normalize_stereo_levels_matches_source_and_limits_peak():
@@ -20,3 +21,20 @@ def test_normalize_stereo_levels_can_leave_channel_balance_untouched():
     generated = np.column_stack((source, source * 0.5))
     result = normalize_stereo_levels(generated, source, match_rms=False, peak_dbfs=0)
     np.testing.assert_allclose(result, generated)
+
+
+def test_shared_amplitude_modulation_uses_identical_gain_for_both_channels():
+    audio = np.column_stack((np.ones(24000), np.full(24000, 2.0))).astype(np.float32)
+    result = apply_shared_amplitude_modulation(audio, 24000, 4.0, 20.0)
+    np.testing.assert_allclose(result[:, 1], result[:, 0] * 2.0, atol=1e-6)
+    assert np.isclose(result[0, 0], 1.0)
+    assert np.max(result[:, 0]) <= 1.2 + 1e-5
+    assert np.min(result[:, 0]) >= 0.8 - 1e-5
+
+
+def test_shared_amplitude_modulation_validates_depth():
+    audio = np.zeros((10, 2), dtype=np.float32)
+    with pytest.raises(ValueError, match="depth"):
+        apply_shared_amplitude_modulation(audio, 24000, 4.0, 101.0)
+    with pytest.raises(ValueError, match="between 2 and 10"):
+        apply_shared_amplitude_modulation(audio, 24000, 1.0, 20.0)

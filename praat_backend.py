@@ -357,3 +357,20 @@ def normalize_stereo_levels(audio: np.ndarray, reference: np.ndarray, *,
     if peak > ceiling > 0:
         result *= ceiling / peak
     return np.clip(result, -ceiling, ceiling).astype(np.float32)
+
+
+def apply_shared_amplitude_modulation(audio: np.ndarray, sample_rate: int,
+                                      rate_hz: float, depth_percent: float) -> np.ndarray:
+    """Apply identical sinusoidal amplitude modulation to both channels."""
+    source = np.asarray(audio, dtype=np.float32)
+    if source.ndim != 2 or source.shape[1] != 2:
+        raise ValueError("Stereo audio must have shape (samples, 2)")
+    if not np.isfinite(rate_hz) or not 2.0 <= rate_hz <= 10.0:
+        raise ValueError("Modulation rate must lie between 2 and 10 Hz")
+    if not np.isfinite(depth_percent) or not 0 <= depth_percent <= 100:
+        raise ValueError("Modulation depth must lie between 0 and 100 percent")
+    if source.size == 0 or depth_percent == 0:
+        return source.copy()
+    times = np.arange(len(source), dtype=np.float64) / float(sample_rate)
+    gain = 1.0 + (float(depth_percent) / 100.0) * np.sin(2.0 * np.pi * float(rate_hz) * times)
+    return (source.astype(np.float64) * gain[:, None]).astype(np.float32)
